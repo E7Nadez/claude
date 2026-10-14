@@ -28,6 +28,7 @@ local Audio = require(ShopFolder.Audio)
 local Effects = require(ShopFolder.Effects)
 local CameraDirector = require(ShopFolder.CameraDirector)
 local Sequence = require(ShopFolder.Sequence)
+local Cinematics = require(ShopFolder.Cinematics)
 
 local CapsuleHall = {}
 CapsuleHall.__index = CapsuleHall
@@ -360,6 +361,37 @@ function CapsuleHall:_play(machine, pet: Pets.Pet, result: { [string]: any })
 		UI.Label({ Text = Format.Chance(chance), Position = UDim2.fromScale(0, 0.74), Size = UDim2.new(1, 0, 0.24, 0), TextXAlignment = Enum.TextXAlignment.Center, TextScaled = true, TextColor3 = Theme.Colors.SubText, TextStrokeTransparency = 0.3, Parent = tag })
 		Effects.GlowBall(revealPos, rarity.Color, 12, 0.6)
 		Effects.Shockwave(revealPos - Vector3.new(0, 1.4, 0), rarity.Color, 14)
+		Effects.FlashLight(revealPos, rarity.Color, 8, 30, 0.8)
+		if profile.Pillar then
+			local pillar = Builder.Part({
+				Name = "LightPillar",
+				Shape = Enum.PartType.Cylinder,
+				Size = Vector3.new(0.5, 5, 5),
+				CFrame = CFrame.new(revealPos - Vector3.new(0, 1.5, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+				Material = Enum.Material.Neon,
+				Color = rarity.Color,
+				Transparency = 0.35,
+				CanCollide = false,
+				CanQuery = false,
+				CanTouch = false,
+				CastShadow = false,
+				Parent = self.View.LocalFolder,
+			})
+			owner.Trove:Add(pillar)
+			TweenService:Create(pillar, TweenInfo.new(0.45, Enum.EasingStyle.Quint), {
+				Size = Vector3.new(60, 4, 4),
+				CFrame = CFrame.new(revealPos + Vector3.new(0, 28.5, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+			}):Play()
+			TweenService:Create(pillar, TweenInfo.new(1.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In, 0, false, 0.5), { Transparency = 1, Size = Vector3.new(60, 0.5, 0.5) }):Play()
+		end
+		if Rarities.AtLeast(pet.Rarity, "Epic") then
+			local fan = Effects.LightFan(revealPos, { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) }, 10, 12)
+			owner.Trove:Add(fan.Stop)
+		end
+		if owner.Cine then
+			owner.Cine:Impact(rarity.Color, 0.5 + rarity.Rank * 0.1)
+			owner.Cine:Focus(revealPos)
+		end
 		Effects.Burst(revealPos, "Sparks", profile.SparkBurst * 2, rarity.Color)
 		Effects.Confetti(revealPos + Vector3.new(0, 1, 0), profile.Confetti, { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) })
 		CameraDirector.Punch(profile.FovPunch)
@@ -375,6 +407,9 @@ function CapsuleHall:_play(machine, pet: Pets.Pet, result: { [string]: any })
 	end
 
 	controller:BeginShow(seq)
+	local cine = Cinematics.Begin({ Bloom = 0.5 + Rarities.Get(pet.Rarity).Rank * 0.05 })
+	seq.Cine = cine
+	cine:Focus(machine.DomeCenter)
 	seq:Run(function(s)
 		-- coins into the machine
 		local console = machine.Model:FindFirstChild("Console") :: BasePart?
@@ -397,6 +432,24 @@ function CapsuleHall:_play(machine, pet: Pets.Pet, result: { [string]: any })
 			end)
 		end
 		grabbed.CFrame = CFrame.new(grabPos)
+		cine:Focus(grabbed)
+		do
+			local a0 = Instance.new("Attachment")
+			a0.Position = Vector3.new(0, 0.5, 0)
+			a0.Parent = grabbed
+			local a1 = Instance.new("Attachment")
+			a1.Position = Vector3.new(0, -0.5, 0)
+			a1.Parent = grabbed
+			local trail = Instance.new("Trail")
+			trail.Attachment0 = a0
+			trail.Attachment1 = a1
+			trail.Color = ColorSequence.new(Color3.new(1, 1, 1), machine.Capsule.Color)
+			trail.LightEmission = 1
+			trail.Lifetime = 0.35
+			trail.FaceCamera = true
+			trail.Transparency = NumberSequence.new(0.2, 1)
+			trail.Parent = grabbed
+		end
 		local claw = machine.Claw
 		local top = machine.ClawTop :: Vector3
 		local startPos = machine.ClawPos :: Vector3
@@ -520,11 +573,25 @@ function CapsuleHall:_play(machine, pet: Pets.Pet, result: { [string]: any })
 		TweenService:Create(topHalf, TweenInfo.new(0.6, Enum.EasingStyle.Quad), { CFrame = grabbed.CFrame + Vector3.new(0, 5, 0), Transparency = 1, Size = Vector3.one * 0.5 }):Play()
 		TweenService:Create(bottomHalf, TweenInfo.new(0.6, Enum.EasingStyle.Quad), { CFrame = grabbed.CFrame - Vector3.new(0, 1, 0), Transparency = 1, Size = Vector3.one * 0.5 }):Play()
 		reveal(s)
-		s:Wait(2.2)
+		if not Effects.ReduceMotion() then
+			local orbitStart = os.clock()
+			local camFrom = workspace.CurrentCamera.CFrame.Position
+			local offset = camFrom - revealPos
+			local radius = Vector3.new(offset.X, 0, offset.Z).Magnitude * 0.7
+			local base = math.atan2(offset.Z, offset.X)
+			CameraDirector.Follow(function()
+				local t = os.clock() - orbitStart
+				local a = base + TweenService:GetValue(math.min(t / 2.4, 1), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut) * 1.2
+				return CFrame.lookAt(revealPos + Vector3.new(math.cos(a) * radius, 3 + t * 0.4, math.sin(a) * radius), revealPos + Vector3.new(0, 0.8, 0))
+			end)
+		end
+		s:Wait(2.4)
+		CameraDirector.StopFollow()
 	end, function(s)
 		for _, stop in stops do
 			stop()
 		end
+		cine:End()
 		CameraDirector.StopFollow()
 		if not s.Cancelled and not state.Revealed then
 			-- Skipped: show the result immediately.

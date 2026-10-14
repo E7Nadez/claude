@@ -402,6 +402,74 @@ function Showroom:_buildEntry(entry)
 	entry.HoloUi = buildHolo(entry, vacuum)
 	self.ActiveTrove:Add(model)
 	self.ActiveTrove:Add(entry.HoloUi.Gui)
+
+	-- Projection cone from the podium ring up to the hologram
+	local ringTop = Instance.new("Attachment")
+	ringTop.Name = "ConeBase"
+	ringTop.Position = Vector3.new(0.2, 0, 0)
+	ringTop.Parent = entry.Ring
+	local holoCenter = Instance.new("Attachment")
+	holoCenter.Name = "ConeTop"
+	holoCenter.Parent = entry.Holo
+	local cone = Instance.new("Beam")
+	cone.Attachment0 = ringTop
+	cone.Attachment1 = holoCenter
+	cone.Color = ColorSequence.new(rarity.Color)
+	cone.LightEmission = 1
+	cone.FaceCamera = true
+	cone.Width0 = 1.2
+	cone.Width1 = 7
+	cone.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0.92) })
+	cone.Parent = ringTop
+	entry.Cone = cone
+	self.ActiveTrove:Add(ringTop)
+	self.ActiveTrove:Add(holoCenter)
+
+	-- Rising sparkles around Epic+ podiums
+	if rarity.Rank >= 4 and not Effects.IsLow() then
+		local rise = Effects.Emitter(entry.Ring, "Rise", rarity.Color, if rarity.Rank >= 6 then 10 elseif rarity.Rank == 5 then 6 else 3)
+		rise.Shape = Enum.ParticleEmitterShape.Cylinder
+		rise.ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface
+		rise.EmissionDirection = Enum.NormalId.Right
+		rise.Enabled = true
+		self.ActiveTrove:Add(rise)
+	end
+
+	-- Orbiting light orbs with trails for Legendary / Mythic
+	entry.Orbs = {}
+	if rarity.Rank >= 5 then
+		for k = 1, if rarity.Rank >= 6 then 3 else 2 do
+			local orb = Builder.Part({
+				Name = "Orb",
+				Shape = Enum.PartType.Ball,
+				Size = Vector3.one * 0.45,
+				Material = Enum.Material.Neon,
+				Color = if k % 2 == 0 then rarity.Gradient[2] else rarity.Gradient[1],
+				CanCollide = false,
+				CanQuery = false,
+				CanTouch = false,
+				CastShadow = false,
+				Parent = self.View.LocalFolder,
+			})
+			local a0 = Instance.new("Attachment")
+			a0.Position = Vector3.new(0, 0.18, 0)
+			a0.Parent = orb
+			local a1 = Instance.new("Attachment")
+			a1.Position = Vector3.new(0, -0.18, 0)
+			a1.Parent = orb
+			local trail = Instance.new("Trail")
+			trail.Attachment0 = a0
+			trail.Attachment1 = a1
+			trail.Color = ColorSequence.new(orb.Color)
+			trail.LightEmission = 1
+			trail.Lifetime = 0.45
+			trail.FaceCamera = true
+			trail.Transparency = NumberSequence.new(0.2, 1)
+			trail.Parent = orb
+			self.ActiveTrove:Add(orb)
+			table.insert(entry.Orbs, { Part = orb, Tilt = CFrame.Angles(k * 0.7, k * 1.1, k * 0.35), Speed = 1.6 + k * 0.35, Phase = k * 2.1 })
+		end
+	end
 end
 
 function Showroom:_refreshStates(animateUnlock: boolean)
@@ -505,6 +573,20 @@ function Showroom:_step(dt: number)
 		if index == self.Selected and entry.HoloUi then
 			local scanT = (now % 2.4) / 2.4
 			entry.HoloUi.Scan.Position = UDim2.fromScale(0, scanT * 1.4 - 0.2)
+		end
+		if entry.Orbs and #entry.Orbs > 0 then
+			local center = entry.Display.Position + Vector3.new(0, 2.6, 0)
+			for _, orb in entry.Orbs do
+				local a = now * orb.Speed + orb.Phase
+				local offset = orb.Tilt:VectorToWorldSpace(Vector3.new(math.cos(a) * 3.8, 0, math.sin(a) * 3.8))
+				table.insert(parts, orb.Part)
+				table.insert(frames, CFrame.new(center + offset))
+			end
+		end
+		if entry.Cone then
+			local selected = index == self.Selected
+			local pulse = if selected then 0.45 + math.sin(now * 5) * 0.08 else 0.68
+			entry.Cone.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, pulse), NumberSequenceKeypoint.new(1, 0.93) })
 		end
 	end
 	if #parts > 0 then
@@ -660,8 +742,28 @@ function Showroom:Select(index: number, firstGlide: boolean?)
 	controller.FactoryHud:SetCarouselLabel(string.format("%d / %d", index, count))
 	self:_updateHolo(entry, true)
 	if entry.HoloUi then
-		UI.Pop(entry.HoloUi.Panel, 0.06)
+		-- glitch the hologram in
+		local panel = entry.HoloUi.Panel
+		task.spawn(function()
+			for _, t in { 0.9, 0.3, 0.8, 0.45, 0.7, 0.35 } do
+				panel.BackgroundTransparency = t
+				panel.Position = UDim2.fromOffset(math.random(-6, 6), 0)
+				task.wait(0.04)
+			end
+			panel.Position = UDim2.fromOffset(0, 0)
+		end)
 	end
+	-- floor pulse rings while selected
+	self.PulseToken = (self.PulseToken or 0) + 1
+	local token = self.PulseToken
+	local rarity = Rarities.Get((Vacuums.Get(entry.VacuumId) or { Rarity = "Common" }).Rarity)
+	task.spawn(function()
+		while self.Selected == index and self.PulseToken == token do
+			Effects.Shockwave(entry.Display.Position - Vector3.new(0, 0.1, 0), rarity.Color, 7, 0.9)
+			task.wait(1.6)
+		end
+	end)
+	Effects.Burst(entry.Display.Position + Vector3.new(0, 2, 0), "Glitter", 18, rarity.Color)
 	self:_showPanel(entry)
 end
 

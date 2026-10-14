@@ -147,6 +147,61 @@ function Presets.Paint(e: ParticleEmitter, color: Color3)
 	e.SpreadAngle = Vector2.new(10, 10)
 end
 
+function Presets.Firework(e: ParticleEmitter, color: Color3)
+	e.Texture = TEXTURES.Spark
+	e.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+		ColorSequenceKeypoint.new(0.15, color),
+		ColorSequenceKeypoint.new(1, color:Lerp(Color3.new(0, 0, 0), 0.4)),
+	})
+	e.LightEmission = 1
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.1), NumberSequenceKeypoint.new(0.7, 0.6), NumberSequenceKeypoint.new(1, 0) })
+	e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.8, 0.2), NumberSequenceKeypoint.new(1, 1) })
+	e.Lifetime = NumberRange.new(1.4, 2.2)
+	e.Speed = NumberRange.new(26, 36)
+	e.SpreadAngle = Vector2.new(180, 180)
+	e.Acceleration = Vector3.new(0, -9, 0)
+	e.Drag = 2.2
+end
+
+function Presets.Glitter(e: ParticleEmitter, color: Color3)
+	e.Texture = TEXTURES.Spark
+	e.Color = ColorSequence.new(Color3.new(1, 1, 1), color)
+	e.LightEmission = 1
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 0) })
+	e.Lifetime = NumberRange.new(0.4, 0.9)
+	e.Speed = NumberRange.new(2, 9)
+	e.SpreadAngle = Vector2.new(180, 180)
+	e.Acceleration = Vector3.new(0, -4, 0)
+	e.Drag = 1
+end
+
+function Presets.Mote(e: ParticleEmitter, color: Color3)
+	e.Texture = TEXTURES.Spark
+	e.Color = ColorSequence.new(color)
+	e.LightEmission = 1
+	e.LightInfluence = 0
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.3, 0.14), NumberSequenceKeypoint.new(1, 0) })
+	e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.4, 0.3), NumberSequenceKeypoint.new(1, 1) })
+	e.Lifetime = NumberRange.new(6, 10)
+	e.Speed = NumberRange.new(0.1, 0.5)
+	e.SpreadAngle = Vector2.new(180, 180)
+	e.Acceleration = Vector3.new(0, 0.05, 0)
+	e.RotSpeed = NumberRange.new(-20, 20)
+end
+
+function Presets.Rise(e: ParticleEmitter, color: Color3)
+	e.Texture = TEXTURES.Spark
+	e.Color = ColorSequence.new(Color3.new(1, 1, 1), color)
+	e.LightEmission = 1
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 0) })
+	e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) })
+	e.Lifetime = NumberRange.new(1.4, 2.4)
+	e.Speed = NumberRange.new(2, 4)
+	e.SpreadAngle = Vector2.new(12, 12)
+	e.Drag = 0.5
+end
+
 function Presets.Suction(e: ParticleEmitter, color: Color3)
 	e.Texture = TEXTURES.Spark
 	e.Color = ColorSequence.new(color)
@@ -535,6 +590,137 @@ function Effects.Quake(model: Model, center: Vector3, duration: number): () -> (
 			end
 			Debris:AddItem(attachment, 3)
 		end
+	end
+end
+
+-- Short bright light at a point (welds, impacts).
+function Effects.FlashLight(position: Vector3, color: Color3, brightness: number?, range: number?, duration: number?)
+	local holder = Builder.Part({
+		Name = "FxLight",
+		Size = Vector3.one * 0.2,
+		CFrame = CFrame.new(position),
+		Transparency = 1,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Parent = workspace,
+	})
+	local light = Instance.new("PointLight")
+	light.Color = color
+	light.Brightness = brightness or 6
+	light.Range = range or 12
+	light.Shadows = false
+	light.Parent = holder
+	TweenService:Create(light, TweenInfo.new(duration or 0.2, Enum.EasingStyle.Quad), { Brightness = 0 }):Play()
+	Debris:AddItem(holder, (duration or 0.2) + 0.1)
+end
+
+-- Fan of light beams radiating from a point, kept facing the camera so it
+-- always reads as a halo behind the subject. Returns { Stop = fn }.
+function Effects.LightFan(center: Vector3 | BasePart, colors: { Color3 }, count: number?, radius: number?): { Stop: () -> () }
+	local n = if lowGraphics then 5 else (count or 10)
+	local r = radius or 14
+	local origin = Instance.new("Attachment")
+	origin.Parent = workspace.Terrain
+	local ends = {}
+	local beams = {}
+	for i = 1, n do
+		local tip = Instance.new("Attachment")
+		tip.Parent = workspace.Terrain
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = origin
+		beam.Attachment1 = tip
+		beam.Color = ColorSequence.new(colors[(i - 1) % #colors + 1])
+		beam.LightEmission = 1
+		beam.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) })
+		beam.Width0 = 0.4
+		beam.Width1 = r * 0.28
+		beam.FaceCamera = true
+		beam.Segments = 1
+		beam.Parent = origin
+		table.insert(ends, tip)
+		table.insert(beams, beam)
+	end
+	local start = os.clock()
+	local fade = 0
+	local connection = RunService.RenderStepped:Connect(function(dt)
+		fade = math.min(fade + dt * 2.5, 1)
+		local position = if typeof(center) == "Vector3" then center else (center :: BasePart).Position
+		local camera = workspace.CurrentCamera.CFrame
+		origin.WorldPosition = position
+		local t = os.clock() - start
+		for i, tip in ends do
+			local a = t * 0.45 + (i - 1) / n * math.pi * 2
+			local length = r * fade * (0.75 + 0.25 * math.sin(t * 2 + i))
+			tip.WorldPosition = position + (camera.RightVector * math.cos(a) + camera.UpVector * math.sin(a)) * length - camera.LookVector * 2
+		end
+	end)
+	local stopped = false
+	return {
+		Stop = function()
+			if stopped then
+				return
+			end
+			stopped = true
+			for _, beam in beams do
+				TweenService:Create(beam, TweenInfo.new(0.4), { Width1 = 0, Width0 = 0 }):Play()
+			end
+			task.delay(0.45, function()
+				connection:Disconnect()
+				origin:Destroy()
+				for _, tip in ends do
+					tip:Destroy()
+				end
+			end)
+		end,
+	}
+end
+
+-- Crackling electric arcs around a point. Returns a stop function.
+function Effects.Lightning(center: Vector3, color: Color3, radius: number?, arcs: number?): () -> ()
+	local n = if lowGraphics then 1 else (arcs or 3)
+	local r = radius or 4
+	local rng = Random.new()
+	local rigs = {}
+	for _ = 1, n do
+		local a0 = Instance.new("Attachment")
+		a0.Parent = workspace.Terrain
+		local a1 = Instance.new("Attachment")
+		a1.Parent = workspace.Terrain
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = a0
+		beam.Attachment1 = a1
+		beam.Color = ColorSequence.new(Color3.new(1, 1, 1), color)
+		beam.LightEmission = 1
+		beam.Width0 = 0.25
+		beam.Width1 = 0.12
+		beam.Segments = 12
+		beam.FaceCamera = true
+		beam.Transparency = NumberSequence.new(0)
+		beam.Parent = a0
+		table.insert(rigs, { A0 = a0, A1 = a1, Beam = beam })
+	end
+	local running = true
+	task.spawn(function()
+		while running do
+			for _, rig in rigs do
+				local p0 = center + Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.3, 1), rng:NextNumber(-1, 1)).Unit * r
+				local p1 = center + Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.3, 1), rng:NextNumber(-1, 1)).Unit * r
+				rig.A0.WorldPosition = p0
+				rig.A1.WorldPosition = p1
+				rig.Beam.CurveSize0 = rng:NextNumber(-4, 4)
+				rig.Beam.CurveSize1 = rng:NextNumber(-4, 4)
+				rig.Beam.Enabled = rng:NextNumber() > 0.25
+			end
+			task.wait(0.06)
+		end
+		for _, rig in rigs do
+			rig.A0:Destroy()
+			rig.A1:Destroy()
+		end
+	end)
+	return function()
+		running = false
 	end
 end
 

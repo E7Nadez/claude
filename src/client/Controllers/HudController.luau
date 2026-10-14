@@ -19,6 +19,8 @@ local Theme = require(ShopFolder.UI.Theme)
 local UI = require(ShopFolder.UI.Components)
 local Audio = require(ShopFolder.Audio)
 local Effects = require(ShopFolder.Effects)
+local UIFx = require(ShopFolder.UI.UIFx)
+local DayNight = require(Shared.Util.DayNight)
 
 local HudController = {}
 
@@ -38,6 +40,7 @@ local settingsPanel: Frame? = nil
 
 local pills: { [string]: { Frame: Frame, Label: TextLabel, Shown: number, Held: boolean } } = {}
 local skipCallback: (() -> ())? = nil
+local shopBadge: Frame? = nil
 
 local TOAST_COLORS = {
 	Info = Theme.Colors.Accent,
@@ -83,6 +86,33 @@ local function makePill(currencyId: string, order: number)
 	pills[currencyId] = { Frame = pill, Label = label, Shown = 0, Held = false }
 end
 
+-- Floating "+X" / "-X", spinning glyph and glow ring on a currency pill.
+local function currencyFeedback(pill, delta: number)
+	if delta == 0 or not pill.Frame.Visible then
+		return
+	end
+	local positive = delta > 0
+	local center = Effects.GuiCenter(pill.Frame)
+	UIFx.FloatText(Effects.Layer(), center + Vector2.new(pill.Frame.AbsoluteSize.X * 0.15, 30), (if positive then "+" else "-") .. Format.Abbreviate(math.abs(delta)), if positive then Theme.Colors.Success else Theme.Colors.Danger, 24)
+	local glyph = pill.Frame:FindFirstChild("Glyph")
+	if glyph and glyph:IsA("GuiObject") then
+		glyph.Rotation = 0
+		UI.Tween(glyph, TweenInfo.new(0.6, Enum.EasingStyle.Back), { Rotation = if positive then 360 else -360 })
+		task.delay(0.62, function()
+			glyph.Rotation = 0
+		end)
+	end
+	local stroke = pill.Frame:FindFirstChild("Stroke")
+	if stroke and stroke:IsA("UIStroke") then
+		stroke.Color = if positive then Theme.Colors.Success else Theme.Colors.Danger
+		stroke.Transparency = 0
+		UI.Tween(stroke, TweenInfo.new(0.9), { Transparency = 0.84, Color = Color3.new(1, 1, 1) })
+	end
+	if positive then
+		UIFx.Burst(Effects.Layer(), center - Vector2.new(pill.Frame.AbsoluteSize.X * 0.35, 0), Theme.Colors.Gold, 10, 50)
+	end
+end
+
 local function refreshCurrencies(data: { [string]: any }, animate: boolean)
 	for id, pill in pills do
 		local value = data.Currencies[id] or 0
@@ -90,13 +120,8 @@ local function refreshCurrencies(data: { [string]: any }, animate: boolean)
 		if not pill.Held and value ~= pill.Shown then
 			if animate then
 				UI.CountTo(pill.Label, pill.Shown, value, 0.7)
-				if value > pill.Shown then
-					UI.Pop(pill.Frame, 0.08)
-					local glyph = pill.Frame:FindFirstChild("Glyph")
-					if glyph and glyph:IsA("GuiObject") then
-						UI.Wiggle(glyph, 14)
-					end
-				end
+				UI.Pop(pill.Frame, if value > pill.Shown then 0.1 else 0.05)
+				currencyFeedback(pill, value - pill.Shown)
 			else
 				pill.Label.Text = Format.Abbreviate(value)
 			end
@@ -165,16 +190,16 @@ local function buildSideButtons()
 	}, { UI.List(Enum.FillDirection.Vertical, 10, Enum.HorizontalAlignment.Right) })
 	UI.AutoScale(side)
 
+	local shopHolder = UI.new("Frame", { Name = "ShopHolder", Size = UDim2.fromOffset(64, 64), BackgroundTransparency = 1, LayoutOrder = 1, Parent = side })
 	local shop = UI.Button({
 		Name = "ShopButton",
 		Glyph = "🛒",
 		Text = "",
 		Style = "Gold",
-		Size = UDim2.fromOffset(64, 64),
+		Size = UDim2.fromScale(1, 1),
 		Radius = Theme.Radius.Large,
 		TextSize = 30,
-		LayoutOrder = 1,
-		Parent = side,
+		Parent = shopHolder,
 		OnClick = function()
 			HudController.ShopRequested:Fire()
 		end,
@@ -191,6 +216,21 @@ local function buildSideButtons()
 		Parent = shop.Instance,
 	})
 	shop.Label.Position = UDim2.fromOffset(0, -6)
+	UIFx.Shine(shop.Instance, 6, 0.3)
+	local badge = UI.new("Frame", {
+		Name = "Badge",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(1, -6, 0, 6),
+		Size = UDim2.fromOffset(22, 22),
+		BackgroundColor3 = Theme.Colors.Danger,
+		Visible = false,
+		ZIndex = 8,
+		Parent = shop.Instance.Parent,
+	}, { UI.Corner(Theme.Radius.Pill), UI.Stroke(Color3.new(1, 1, 1), 0.2, 2) })
+	UI.Label({ Text = "!", Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextScaled = true, FontFace = Theme.Fonts.Title, ZIndex = 9, Parent = badge })
+	local badgeScale = UI.GetScale(badge)
+	TweenService:Create(badgeScale, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Scale = 1.18 }):Play()
+	shopBadge = badge
 
 	UI.Button({
 		Name = "SettingsButton",
@@ -318,6 +358,23 @@ function HudController:Start()
 		refreshCurrencies(data, previous ~= nil)
 		refreshBoosts(data)
 	end)
+	-- "!" on the shop button while today's Mystery Crate is waiting
+	task.spawn(function()
+		while true do
+			local data = ClientData:Get()
+			local badge = shopBadge
+			if data and badge then
+				local available = data.Daily.CrateDay ~= DayNight.Day(workspace:GetServerTimeNow())
+				if available ~= badge.Visible then
+					badge.Visible = available
+					if available then
+						UI.Pop(badge, 0.4)
+					end
+				end
+			end
+			task.wait(2)
+		end
+	end)
 	local data = ClientData:Get()
 	if data then
 		refreshCurrencies(data, false)
@@ -367,6 +424,7 @@ function HudController:ReleaseCurrency(currencyId: string, duration: number?)
 	local value = ClientData:Currency(currencyId)
 	if value ~= pill.Shown then
 		UI.CountTo(pill.Label, pill.Shown, value, duration or 0.6, nil, true)
+		currencyFeedback(pill, value - pill.Shown)
 		pill.Shown = value
 	end
 end
@@ -411,6 +469,18 @@ function HudController:Toast(text: string, kind: string?)
 	local scale = UI.GetScale(toast)
 	scale.Scale = 0.6
 	UI.Tween(scale, Theme.Tween.Spring, { Scale = 1 })
+	local timerBar = UI.new("Frame", {
+		Name = "Timer",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -3),
+		Size = UDim2.new(1, -40, 0, 2),
+		BackgroundColor3 = color,
+		BackgroundTransparency = 0.3,
+		ZIndex = 4,
+		Parent = toast,
+	}, { UI.Corner(Theme.Radius.Pill) })
+	UI.Tween(timerBar, TweenInfo.new(3.2, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 0, 2) })
+	UIFx.Shine(toast, 10, 0.2)
 	if kind == "Error" then
 		Audio.Play("Error")
 	end
@@ -532,6 +602,31 @@ function HudController:Banner(spec: { Title: string, Subtitle: string?, Rarity: 
 	UI.new("UITextSizeConstraint", { MaxTextSize = if big then 54 else 38, Parent = title })
 	UI.Gradient({ Color3.new(1, 1, 1), rarity.Color:Lerp(Color3.new(1, 1, 1), 0.4) }, 90).Parent = title
 
+	-- Light rays fan out behind the card (bigger for rarer drops)
+	local rays = nil
+	if big then
+		rays = UIFx.Rays(holder, rarity.Color, { Count = if spec.Style == "Epic" then 12 else 8, Speed = 10, Size = if spec.Style == "Epic" then 3.4 else 2.4, ZIndex = 0, Transparency = if spec.Style == "Epic" then 0.45 else 0.62 })
+		rays.Size = UDim2.fromScale(0, 0)
+		UI.Tween(rays, TweenInfo.new(0.6, Enum.EasingStyle.Back), { Size = UDim2.fromScale(if spec.Style == "Epic" then 3.4 else 2.4, if spec.Style == "Epic" then 3.4 else 2.4) })
+	end
+	local underline = UI.new("Frame", {
+		Name = "Underline",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 36),
+		Size = UDim2.fromOffset(0, 2),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		ZIndex = 3,
+		Parent = card,
+	}, { UI.Corner(Theme.Radius.Pill), UI.Gradient(Rarities.ColorSequence(rarity.Id), 0) })
+	UI.Tween(underline, TweenInfo.new(0.6, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, 0, false, 0.15), { Size = UDim2.fromOffset(if big then 180 else 120, 2) })
+	title.Position = UDim2.new(0, 16, 0, 40)
+	UIFx.Typewriter(title, if big then 0.55 else 0.35)
+	local stopSparkles = if rarity.Rank >= 4 then UIFx.Sparkles(card, rarity.Color, if rarity.Rank >= 6 then 8 else 5) else nil
+	local stopShine = UIFx.Shine(card, 1.6, 0.25)
+	if rarity.Rank >= 4 then
+		UIFx.Foil(card, rarity.Id, Theme.Radius.Large, 0.18)
+	end
+
 	local scale = UI.GetScale(card)
 	scale.Scale = 0.3
 	card.Rotation = -6
@@ -539,6 +634,7 @@ function HudController:Banner(spec: { Title: string, Subtitle: string?, Rarity: 
 	UI.Tween(card, Theme.Tween.Spring, { Rotation = 0 })
 	local spin = TweenService:Create(strokeGradient, TweenInfo.new(2, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1), { Rotation = 360 })
 	spin:Play()
+	UIFx.Burst(Effects.Layer(), Effects.GuiCenter(holder), rarity.Color, if big then 26 else 14, if big then 260 else 160)
 	if spec.Style == "Epic" then
 		Effects.UIConfetti(60, { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) })
 	end
@@ -546,8 +642,15 @@ function HudController:Banner(spec: { Title: string, Subtitle: string?, Rarity: 
 	task.delay(spec.Duration or 2.4, function()
 		UI.Tween(scale, Theme.Tween.Close, { Scale = 0.7 })
 		UI.Tween(card, Theme.Tween.Close, { BackgroundTransparency = 1 })
+		if rays then
+			UI.Tween(rays, Theme.Tween.Close, { Size = UDim2.fromScale(0, 0) })
+		end
 		task.wait(0.22)
 		spin:Cancel()
+		stopShine()
+		if stopSparkles then
+			stopSparkles()
+		end
 		holder:Destroy()
 	end)
 end

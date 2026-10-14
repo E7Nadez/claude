@@ -27,6 +27,7 @@ local Audio = require(ShopFolder.Audio)
 local Effects = require(ShopFolder.Effects)
 local CameraDirector = require(ShopFolder.CameraDirector)
 local Sequence = require(ShopFolder.Sequence)
+local Cinematics = require(ShopFolder.Cinematics)
 
 local Lobby = {}
 Lobby.__index = Lobby
@@ -404,6 +405,8 @@ function Lobby:_open()
 	end
 
 	controller:BeginShow(seq)
+	local cine = Cinematics.Begin({ Bloom = 0.6 + rarity.Rank * 0.06 })
+	cine:Focus(padCf.Position + Vector3.new(0, 2, 0))
 	seq:Run(function(s)
 		controller:CoinFlight(result.Currency or "Coins", result.Price or 0, padCf.Position + Vector3.new(0, 2, 0))
 		if not s:Wait(0.8) then
@@ -447,7 +450,11 @@ function Lobby:_open()
 		TweenService:Create(beam, TweenInfo.new(0.6, Enum.EasingStyle.Quint), { Size = Vector3.new(30, 3, 3), CFrame = beam.CFrame + Vector3.new(0, 15, 0), Transparency = 0.6 }):Play()
 		Effects.GlowBall(padCf.Position + Vector3.new(0, 3, 0), rarity.Color, 10, 0.6)
 		Effects.Burst(padCf.Position + Vector3.new(0, 3, 0), "Sparks", profile.SparkBurst * 2, rarity.Color)
+		Effects.FlashLight(padCf.Position + Vector3.new(0, 4, 0), rarity.Color, 7, 26, 0.9)
 		CameraDirector.Punch(profile.FovPunch)
+		cine:Impact(rarity.Color, 0.5 + rarity.Rank * 0.08)
+		local fan = Effects.LightFan(padCf.Position + Vector3.new(0, 3.5, 0), { rarity.Gradient[1], rarity.Gradient[2], Theme.Colors.Gold }, 10, 11)
+		s.Trove:Add(fan.Stop)
 		Audio.Play("Fanfare")
 		if reward.Kind == "Pet" and reward.PetId then
 			local petModel = PetModel.Build(reward.PetId)
@@ -470,6 +477,7 @@ function Lobby:_open()
 			self:_placeCrate(padCf * CFrame.new(0, -a * CRATE_SIZE, 0))
 		end)
 	end, function(s)
+		cine:End()
 		if not s.Cancelled then
 			show()
 		end

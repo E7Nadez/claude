@@ -15,6 +15,7 @@ FactoryView.__index = FactoryView
 
 local ZONE_ORDER = {
 	"Ambience",
+	"Spectacle",
 	"Workers",
 	"Showroom",
 	"TestChamber",

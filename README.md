@@ -78,6 +78,21 @@ Antworten haben immer die Form `{ Ok = true, ... }` oder `{ Ok = false, Code = "
 | **Lobby** | Förderband bringt alle 24 h (UTC) eine Mystery Crate mit Countdown-Bildschirm; Night-Deals-Stand leuchtet nachts. |
 | **Leben** | Roboter-Arbeiter laufen synchron für alle Spieler (Serverzeit), drehen sich bei seltenen Käufen zum Käufer und jubeln. Käufe anderer erscheinen im Feed mit Konfetti am Käufer. |
 
+### Premium-Effekte („AAA-Politur“)
+
+| Bereich | Effekte |
+|---|---|
+| **Kino-Look** (`Shop/Cinematics.luau`) | Letterbox-Balken, Tiefenschärfe mit Fokusnachführung aufs Objekt, Bloom, Color-Grading, Vignette, „Impact Frames“ im Höhepunkt jeder Show (Kauf, Kapsel, Crate, Einfahrt). |
+| **Fabrik-Spektakel** (`Zones/Spectacle.luau`) | Lauflichter ums Hauptschild mit Einschalt-Flackern, Suchscheinwerfer bei Nacht, zwei rotierende Hologramme (ForceField-Material) des Mythic-Saugers am Eingang, Lieferdrohnen mit Fracht über dem Dach (synchron per Serverzeit), Lichtschächte durch die Oberlichter (folgen der Sonne), schwebende Staubpartikel, Luftstrom + eingesaugtes Laub an der Röhre, Lauflicht-Pfeile auf dem Vorplatz, **Feuerwerk** über der Fabrik bei Epic+-Käufen (für alle sichtbar). |
+| **Showroom** | Projektionskegel vom Podest zum Hologramm, aufsteigende Funken ab Epic, umkreisende Licht-Orbs mit Leuchtspur bei Legendary/Mythic, pulsierende Bodenringe am gewählten Podest, Glitch-Einblendung der Hologramme. |
+| **Kauf-Show** | Schweißblitze mit echtem Punktlicht, Blitzbögen ab Legendary, „Hero Shot“: Kamerafahrt um das fertige Modell mit Lichtfächer, Spot-Licht und eingeblendetem Namen (ab Epic). |
+| **Kapseln / Crate / Tresor / Labor** | Leuchtspur der Kapsel auf der Kugelbahn, Lichtsäule + Lichtfächer + Kamerafahrt bei der Enthüllung, goldene Strahlen aus dem aufschwingenden Tresor, „LEVEL UP“-Label über wachsenden Maschinen. |
+| **Klassisches Fenster** (`UI/UIFx.luau`) | Öffnungs-Choreografie (Vignette, Akzentlinie zeichnet sich, Header gleitet herein, Tabs und Karten kaskadieren), schimmernder Glasrand, Bokeh-Hintergrund, weiche Kartenschatten, Parallax-Tilt beim Hover, Holo-Folie (Epic+), Funkeln + Strahlenkranz (Legendary+), schwebende Icons (Mythic), flüssiger Tab-Indikator, Richtungs-Übergang beim Tabwechsel, Ripple beim Klick, Call-to-Action-Glint auf kaufbaren Items, „PURCHASED!“-Stempel mit Partikel-Burst, Kartenflip-Enthüllung für Pets und Crate-Loot. |
+| **Modal** | Öffnet sich aus der angeklickten Karte heraus und schrumpft beim Schließen dorthin zurück; 3D-Vorschau auf leuchtendem Drehteller mit Strahlenkranz, Glow und Funkeln; Schreibmaschinen-Titel. |
+| **HUD** | Schwebende „+1.2K“/„−250“-Zahlen, rotierendes Währungssymbol mit Glow-Ring, Banner mit Lichtstrahlen, Glint, Unterstrich-Animation und Schreibmaschinen-Titel, Toasts mit Timer-Leiste, pulsierender „!“-Badge am Shop-Button, sobald die Mystery Crate bereitsteht. |
+
+Alle Stärken stehen datengetrieben in `Sequences.luau` (`HeroShot`, `Lightning`, `Fireworks`, `Pillar` pro Rarity). **Low Graphics** schaltet Tiefenschärfe/Bloom ab und reduziert Lauflichter, Suchscheinwerfer, Drohnen, Lichtschächte, Partikel, Feuerwerk, Funkeln, Strahlen, Schattenlagen und Parallax; **Reduce Motion** verzichtet zusätzlich auf Hero-Shot-Kamerafahrten, Orbit-Kameras und Kamerawackeln.
+
 **Schlankes HUD in der Fabrik:** Zonen-Schnellreise links, Kontext-Panel rechts (auf dem Handy unten), Karussell-Pfeile, Zurück-Button, Eingabehinweise. **🛒 Quick** öffnet jederzeit den klassischen Modus.
 
 **Steuerung:** Alles per Tippen/Klicken. Tastatur: ←/→ blättern, Enter kaufen, T testen, Backspace zurück, Leertaste überspringen, Q/E Tabs. Gamepad: D-Pad/LB/RB, A, X, B, Y (Shop).

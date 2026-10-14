@@ -30,6 +30,7 @@ local FactoryHud = require(ShopFolder.FactoryHud)
 local FactoryView = require(ShopFolder.FactoryView)
 local CameraDirector = require(ShopFolder.CameraDirector)
 local Effects = require(ShopFolder.Effects)
+local UIFx = require(ShopFolder.UI.UIFx)
 local Audio = require(ShopFolder.Audio)
 local PurchaseShow = require(ShopFolder.Shows.PurchaseShow)
 local EntryShow = require(ShopFolder.Shows.EntryShow)
@@ -392,21 +393,30 @@ function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any 
 		PurchaseShow.Play(view, item.RefId, result)
 		return
 	end
-	local button = self.Classic.IsOpen and self.Classic:CelebrateFrom(item.Id)
-	self:CoinFlight(item.Currency, result.Price or 0, button or nil)
-	Audio.Play("Success")
 	local rarityId = result.Rarity or item.Rarity
 	local rarity = Rarities.Get(rarityId)
 	local profile = Sequences.Get(rarityId)
+	local stamp = if item.Kind == "Capsule" or item.Kind == "DailyCrate" then "OPENED!" elseif item.Kind == "Upgrade" then "UPGRADED!" else "PURCHASED!"
+	local button = self.Classic.IsOpen and self.Classic:CelebrateFrom(item.Id, stamp, rarityId)
+	self:CoinFlight(item.Currency, result.Price or 0, button or nil)
+	Audio.Play("Success")
+	local classicOpen = self.Classic.IsOpen
 	if item.Kind == "Vacuum" then
 		self.Hud:Banner({ Title = item.Name, Subtitle = "New vacuum  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
 		Effects.ScreenFlash(rarity.Color, 0.25, 0.6)
 		Effects.UIConfetti(math.floor(profile.Confetti / 2), { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) })
 	elseif item.Kind == "Capsule" then
 		local pet = Pets.Get(result.PetId)
-		self.Hud:Banner({ Title = if pet then pet.Name else "New pet", Subtitle = "You hatched  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
-		if Rarities.AtLeast(rarityId, "Rare") then
-			Effects.UIConfetti(math.floor(profile.Confetti / 2), { rarity.Gradient[1], rarity.Gradient[2] })
+		if classicOpen then
+			self.Classic:Reveal({
+				Title = if pet then pet.Name else "New pet",
+				Subtitle = if pet then string.format("x%s coin multiplier", Format.Stat(pet.Multiplier)) else nil,
+				Glyph = "🐾",
+				Rarity = rarityId,
+				BackColor = Rarities.Get(item.Rarity).Color:Lerp(Color3.new(0, 0, 0), 0.4),
+			})
+		else
+			self.Hud:Banner({ Title = if pet then pet.Name else "New pet", Subtitle = "You hatched  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
 		end
 	elseif item.Kind == "DailyCrate" then
 		local reward = result.Reward or {}
@@ -414,8 +424,12 @@ function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any 
 		if reward.Kind == "Coins" then
 			text = "+" .. Format.Abbreviate(reward.Amount or 0) .. " Coins"
 		end
-		self.Hud:Banner({ Title = text, Subtitle = "Mystery Crate  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
-		Effects.UIConfetti(40)
+		if classicOpen then
+			self.Classic:Reveal({ Title = text, Subtitle = "From today's Mystery Crate", Glyph = "📦", Rarity = rarityId, BackColor = Color3.fromRGB(90, 64, 30) })
+		else
+			self.Hud:Banner({ Title = text, Subtitle = "Mystery Crate  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
+			Effects.UIConfetti(40)
+		end
 	elseif item.Kind == "Upgrade" then
 		self.Hud:Toast(string.format("%s upgraded to Lv %d!", item.Name, result.Level or 0), "Success")
 	elseif item.Kind == "Boost" then
@@ -562,6 +576,10 @@ function ShopController:_onBroadcast(payload: any)
 				Effects.Confetti(position + Vector3.new(0, 3, 0), 8 * rarity.Rank, { rarity.Gradient[1], rarity.Gradient[2] }, 0.6)
 				Effects.Burst(position, "Glow", 6 * rarity.Rank, rarity.Color)
 			end
+			local fireworks = Sequences.Get(rarityId).Fireworks
+			if fireworks > 0 and view.Zones.Spectacle then
+				view.Zones.Spectacle:Fireworks({ rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1), view.Theme.Neon }, fireworks)
+			end
 			if not isMe and payload.Kind == "Capsule" and view.Zones.CapsuleHall then
 				local item = Shop.Get(payload.ItemId)
 				if item then
@@ -578,6 +596,7 @@ local function applySettings(self)
 	local low = self.ClientData:LowGraphics()
 	local reduce = self.ClientData:ReduceMotion()
 	Effects.SetLowGraphics(low)
+	UIFx.SetLowGraphics(low)
 	Effects.SetReduceMotion(reduce)
 	CameraDirector.SetReduceMotion(reduce)
 	if lastLowGraphics ~= nil and lastLowGraphics ~= low then

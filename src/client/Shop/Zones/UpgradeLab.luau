@@ -259,8 +259,38 @@ function UpgradeLab:_celebrate(machine)
 	Effects.Burst(mountCf.Position + Vector3.new(0, 3, 0), "Sparks", 40, color)
 	Effects.Burst(mountCf.Position + Vector3.new(0, 3, 0), "Glow", 16, color)
 	Effects.Shockwave(mountCf.Position, color, 9)
+	Effects.FlashLight(mountCf.Position + Vector3.new(0, 4, 0), color, 6, 22, 0.6)
 	Audio.PlayAt("Weld", mountCf.Position)
 	Audio.Play("Success")
+	-- "LEVEL UP" label rising out of the machine
+	local anchor = Builder.Part({
+		Name = "LevelUpAnchor",
+		Size = Vector3.one * 0.2,
+		CFrame = mountCf * CFrame.new(0, 6, 0),
+		Transparency = 1,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Parent = self.View.LocalFolder,
+	})
+	local tag = UI.new("BillboardGui", { Size = UDim2.fromOffset(260, 70), AlwaysOnTop = true, Adornee = anchor, Parent = anchor })
+	local label = UI.Label({
+		Text = "LEVEL UP!  LV " .. tostring(math.max(machine.Level + 1, 1)),
+		Size = UDim2.fromScale(1, 1),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextScaled = true,
+		FontFace = Theme.Fonts.Title,
+		TextColor3 = color:Lerp(Color3.new(1, 1, 1), 0.3),
+		TextStrokeTransparency = 0.3,
+		Parent = tag,
+	})
+	TweenService:Create(tag, TweenInfo.new(1.6, Enum.EasingStyle.Quint), { StudsOffset = Vector3.new(0, 5, 0) }):Play()
+	task.delay(1, function()
+		TweenService:Create(label, TweenInfo.new(0.6), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	end)
+	task.delay(1.7, function()
+		anchor:Destroy()
+	end)
 end
 
 function UpgradeLab:SetActive(active: boolean)

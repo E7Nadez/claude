@@ -211,7 +211,12 @@ function TrophyVault:TryOpen()
 	end)
 	task.delay(1.0, function()
 		if self.Anchor then
-			Effects.GlowBall(self.Anchor.Position + self.Anchor.CFrame.LookVector * -4, Color3.fromRGB(255, 210, 120), 18, 1)
+			local inside = self.Anchor.Position + self.Anchor.CFrame.LookVector * -4
+			Effects.GlowBall(inside, Color3.fromRGB(255, 210, 120), 18, 1)
+			Effects.FlashLight(inside, Color3.fromRGB(255, 220, 150), 6, 40, 2.5)
+			Effects.Burst(inside, "Glitter", 40, Color3.fromRGB(255, 210, 120))
+			local fan = Effects.LightFan(inside, { Color3.fromRGB(255, 214, 120), Color3.fromRGB(255, 245, 210) }, 12, 16)
+			task.delay(2.6, fan.Stop)
 			Audio.PlayAt("Fanfare", self.Anchor.Position)
 		end
 	end)

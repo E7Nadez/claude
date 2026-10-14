@@ -30,7 +30,10 @@ local TrophyModel = require(Shared.Models.TrophyModel)
 
 local Theme = require(script.Parent.UI.Theme)
 local UI = require(script.Parent.UI.Components)
+local UIFx = require(script.Parent.UI.UIFx)
 local Audio = require(script.Parent.Audio)
+local Effects = require(script.Parent.Effects)
+local Builder = require(Shared.Util.Builder)
 
 local ConfirmModal = {}
 ConfirmModal.__index = ConfirmModal
@@ -273,29 +276,64 @@ local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
 		return
 	end
 	local rarity = Rarities.Get(item.Rarity)
-	local viewport = UI.new("ViewportFrame", {
+	-- Stage: dark rounded backdrop with a rarity glow and rotating light rays
+	local stage = UI.new("Frame", {
+		Name = "Stage",
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = Theme.Colors.Backdrop,
-		BackgroundTransparency = 0.4,
-		Ambient = Color3.fromRGB(160, 160, 180),
-		LightColor = Color3.new(1, 1, 1),
-		LightDirection = Vector3.new(-1, -1.2, -0.6),
+		BackgroundTransparency = 0.3,
 		Parent = holder,
 	}, { UI.Corner(Theme.Radius.Large), UI.Stroke(rarity.Color, 0.3, 2) })
-	UI.Gradient(Rarities.ColorSequence(rarity.Id), 135, NumberSequence.new(0.75)).Parent = viewport
+	UI.Gradient(Rarities.ColorSequence(rarity.Id), 135, NumberSequence.new(0.78)).Parent = stage
+	UIFx.Glow(stage, rarity.Color, 0.95, 0.9)
+	UIFx.Rays(stage, rarity.Color, { Count = 8, Speed = 16, Size = 1, Transparency = if rarity.Rank >= 5 then 0.55 else 0.75 })
+	local viewport = UI.new("ViewportFrame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Ambient = Color3.fromRGB(170, 170, 190),
+		LightColor = Color3.new(1, 1, 1),
+		LightDirection = Vector3.new(-1, -1.2, -0.6),
+		ZIndex = 3,
+		Parent = holder,
+	})
+	if rarity.Rank >= 5 then
+		self.Trove:Add(UIFx.Sparkles(holder, rarity.Color, 6))
+	end
 	local camera = Instance.new("Camera")
-	camera.FieldOfView = 40
+	camera.FieldOfView = 38
 	camera.Parent = viewport
 	viewport.CurrentCamera = camera
 	model.Parent = viewport
 	local size = model:GetExtentsSize()
 	local radius = math.max(size.X, size.Y, size.Z)
 	local center = Vector3.new(0, size.Y / 2, 0)
+	-- Glowing turntable under the model
+	Builder.Part({
+		Name = "Turntable",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.2, radius * 1.15, radius * 1.15),
+		CFrame = CFrame.new(0, -0.1, 0) * CFrame.Angles(0, 0, math.pi / 2),
+		Color = rarity.Color:Lerp(Color3.new(0, 0, 0), 0.55),
+		Material = Enum.Material.SmoothPlastic,
+		Parent = viewport,
+	})
+	Builder.Part({
+		Name = "Rim",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.12, radius * 1.22, radius * 1.22),
+		CFrame = CFrame.new(0, -0.14, 0) * CFrame.Angles(0, 0, math.pi / 2),
+		Color = rarity.Color,
+		Material = Enum.Material.Neon,
+		Parent = viewport,
+	})
 	local angle = 0
+	local t = 0
 	self.Trove:Connect(RunService.RenderStepped, function(dt)
 		angle += dt * 0.8
-		model:PivotTo(CFrame.Angles(0, angle, 0))
-		camera.CFrame = CFrame.lookAt(center + Vector3.new(0, radius * 0.35, radius * 1.65), center)
+		t += dt
+		model:PivotTo(CFrame.new(0, 0.05 + math.sin(t * 1.6) * 0.06 * radius, 0) * CFrame.Angles(0, angle, 0))
+		local lift = radius * (0.3 + math.sin(t * 0.7) * 0.06)
+		camera.CFrame = CFrame.lookAt(center + Vector3.new(math.sin(t * 0.4) * radius * 0.15, lift, radius * 1.7), center)
 	end)
 end
 
@@ -355,9 +393,29 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		Parent = holder,
 	})
 	self.Card = card
+	self.Holder = holder
+	local cardStroke = card:FindFirstChild("Stroke") :: UIStroke
+	cardStroke.Thickness = 2
+	UI.Gradient(Rarities.ColorSequence(rarity.Id), 0).Parent = cardStroke
+	if rarity.Rank >= 4 then
+		UIFx.Foil(card, rarity.Id, Theme.Radius.Large, 0.1)
+	end
 	local scale = UI.GetScale(card)
-	scale.Scale = 0.82
-	UI.Tween(scale, Theme.Tween.Open, { Scale = 1 })
+	-- Morph out of the card that was clicked (if any)
+	local from = opts.FromGui
+	self.FromGui = from
+	if typeof(from) == "Instance" and from:IsA("GuiObject") and from.AbsoluteSize.X > 0 then
+		local center = Effects.GuiCenter(from)
+		holder.Position = UDim2.fromOffset(center.X, center.Y)
+		scale.Scale = math.clamp(from.AbsoluteSize.X / (560 * math.max(autoScale.Scale, 0.01)), 0.15, 0.9)
+		card.Rotation = -4
+		UI.Tween(holder, TweenInfo.new(0.42, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Position = UDim2.fromScale(0.5, 0.5) })
+		UI.Tween(scale, TweenInfo.new(0.48, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+		UI.Tween(card, TweenInfo.new(0.48, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Rotation = 0 })
+	else
+		scale.Scale = 0.82
+		UI.Tween(scale, Theme.Tween.Open, { Scale = 1 })
+	end
 
 	-- Header: preview + title block
 	local preview = UI.new("Frame", { Position = UDim2.fromOffset(24, 24), Size = UDim2.fromOffset(170, 170), BackgroundTransparency = 1, Parent = card })
@@ -367,6 +425,8 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	UI.RarityTag(item.Rarity, { LayoutOrder = 1, Parent = titleBlock })
 	local title = UI.Label({ Text = item.Name, Size = UDim2.new(1, 0, 0, 36), FontFace = Theme.Fonts.Title, TextSize = 30, TextScaled = true, LayoutOrder = 2, Parent = titleBlock })
 	UI.new("UITextSizeConstraint", { MaxTextSize = 30, Parent = title })
+	UI.Gradient({ Color3.new(1, 1, 1), rarity.Color:Lerp(Color3.new(1, 1, 1), 0.45) }, 90).Parent = title
+	UIFx.Typewriter(title, 0.45)
 	local category = (function()
 		for _, c in Shop.Categories do
 			if c.Id == item.Category then
@@ -512,7 +572,11 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 				confirm:SetStyle("Success")
 				confirm:SetText("✔")
 				UI.Pop(confirm.Instance, 0.2)
-				task.wait(0.35)
+				UIFx.Burst(Effects.Layer(), Effects.GuiCenter(confirm.Instance), Theme.Colors.Success, 20, 120)
+				if state == "Available" then
+					UIFx.Stamp(card, if result.Pending then "CHECKOUT…" else "PURCHASED!", rarity.Color:Lerp(Color3.new(1, 1, 1), 0.25), 0.5)
+				end
+				task.wait(0.55)
 				self:Close()
 			else
 				errorLabel.Text = result.Error or "Something went wrong."
@@ -523,6 +587,12 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	})
 	if not (affordable or state ~= "Available") then
 		errorLabel.Text = "Not enough " .. (if currency then currency.Name else item.Currency) .. "."
+	end
+	if confirm.Enabled then
+		self.Trove:Add(UIFx.Shine(confirm.Instance, 2.6, 0.25))
+		self.Trove:Connect(confirm.Instance.Activated, function()
+			UIFx.Ripple(confirm.Instance)
+		end)
 	end
 
 	-- Close button
@@ -567,13 +637,23 @@ function ConfirmModal:Close(immediate: boolean?)
 	local card = self.Card
 	local trove = self.Trove
 	self.Trove = Trove.new()
+	local from = self.FromGui
+	self.FromGui = nil
 	if card and not immediate then
-		UI.Tween(UI.GetScale(card), Theme.Tween.Close, { Scale = 0.85 })
+		if typeof(from) == "Instance" and from.Parent and (from :: GuiObject).AbsoluteSize.X > 0 and self.Holder then
+			-- shrink back into the card it came from
+			local center = Effects.GuiCenter(from :: GuiObject)
+			UI.Tween(self.Holder, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.fromOffset(center.X, center.Y) })
+			UI.Tween(UI.GetScale(card), TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.25 })
+			UI.Tween(card, TweenInfo.new(0.22), { BackgroundTransparency = 1 })
+		else
+			UI.Tween(UI.GetScale(card), Theme.Tween.Close, { Scale = 0.85 })
+		end
 		local backdrop = self.Gui:FindFirstChild("Backdrop")
 		if backdrop then
 			UI.Tween(backdrop, Theme.Tween.Close, { BackgroundTransparency = 1 })
 		end
-		task.delay(0.2, function()
+		task.delay(0.22, function()
 			trove:Clean()
 			if not self.Open then
 				self.Gui.Enabled = false

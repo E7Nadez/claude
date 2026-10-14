@@ -17,6 +17,10 @@
 --   Orbit        camera orbits the bay during assembly
 --   Banner       "Small" | "Big" | "Epic"
 --   CapsuleWobble   capsule shakes before it opens (reveal sequence)
+--   HeroShot     cinematic orbit around the finished item with a light fan
+--   Lightning    electric arcs crackle around the assembly
+--   Fireworks    rockets launched above the factory (seen by everyone near)
+--   Pillar       light pillar shoots up on reveals
 
 export type Profile = {
 	Duration: number,
@@ -34,17 +38,21 @@ export type Profile = {
 	Orbit: boolean,
 	Banner: "Small" | "Big" | "Epic",
 	CapsuleWobble: number,
+	HeroShot: boolean,
+	Lightning: boolean,
+	Fireworks: number,
+	Pillar: boolean,
 }
 
 local Sequences = {}
 
 Sequences.ByRarity = {
-	Common = { Duration = 2.2, ArmCount = 2, SparkBurst = 8, LightShow = false, LightCount = 0, Shake = 0, Quake = false, SkyTint = nil, Confetti = 30, NpcCheer = false, Broadcast = "Factory", FovPunch = 0, Orbit = false, Banner = "Small", CapsuleWobble = 1 },
-	Uncommon = { Duration = 2.8, ArmCount = 2, SparkBurst = 12, LightShow = false, LightCount = 0, Shake = 0, Quake = false, SkyTint = nil, Confetti = 45, NpcCheer = false, Broadcast = "Factory", FovPunch = 2, Orbit = false, Banner = "Small", CapsuleWobble = 2 },
-	Rare = { Duration = 3.6, ArmCount = 3, SparkBurst = 18, LightShow = false, LightCount = 0, Shake = 0.05, Quake = false, SkyTint = nil, Confetti = 70, NpcCheer = true, Broadcast = "Factory", FovPunch = 4, Orbit = false, Banner = "Big", CapsuleWobble = 2 },
-	Epic = { Duration = 4.6, ArmCount = 4, SparkBurst = 26, LightShow = false, LightCount = 0, Shake = 0.12, Quake = false, SkyTint = nil, Confetti = 110, NpcCheer = true, Broadcast = "Factory", FovPunch = 6, Orbit = true, Banner = "Big", CapsuleWobble = 3 },
-	Legendary = { Duration = 6.2, ArmCount = 4, SparkBurst = 36, LightShow = true, LightCount = 6, Shake = 0.2, Quake = false, SkyTint = nil, Confetti = 170, NpcCheer = true, Broadcast = "Server", FovPunch = 8, Orbit = true, Banner = "Epic", CapsuleWobble = 4 },
-	Mythic = { Duration = 8, ArmCount = 6, SparkBurst = 48, LightShow = true, LightCount = 10, Shake = 0.6, Quake = true, SkyTint = Color3.fromRGB(255, 70, 150), Confetti = 260, NpcCheer = true, Broadcast = "Server", FovPunch = 12, Orbit = true, Banner = "Epic", CapsuleWobble = 5 },
+	Common = { Duration = 2.2, ArmCount = 2, SparkBurst = 8, LightShow = false, LightCount = 0, Shake = 0, Quake = false, SkyTint = nil, Confetti = 30, NpcCheer = false, Broadcast = "Factory", FovPunch = 0, Orbit = false, Banner = "Small", CapsuleWobble = 1, HeroShot = false, Lightning = false, Fireworks = 0, Pillar = false },
+	Uncommon = { Duration = 2.8, ArmCount = 2, SparkBurst = 12, LightShow = false, LightCount = 0, Shake = 0, Quake = false, SkyTint = nil, Confetti = 45, NpcCheer = false, Broadcast = "Factory", FovPunch = 2, Orbit = false, Banner = "Small", CapsuleWobble = 2, HeroShot = false, Lightning = false, Fireworks = 0, Pillar = false },
+	Rare = { Duration = 3.6, ArmCount = 3, SparkBurst = 18, LightShow = false, LightCount = 0, Shake = 0.05, Quake = false, SkyTint = nil, Confetti = 70, NpcCheer = true, Broadcast = "Factory", FovPunch = 4, Orbit = false, Banner = "Big", CapsuleWobble = 2, HeroShot = false, Lightning = false, Fireworks = 0, Pillar = true },
+	Epic = { Duration = 4.6, ArmCount = 4, SparkBurst = 26, LightShow = false, LightCount = 0, Shake = 0.12, Quake = false, SkyTint = nil, Confetti = 110, NpcCheer = true, Broadcast = "Factory", FovPunch = 6, Orbit = true, Banner = "Big", CapsuleWobble = 3, HeroShot = true, Lightning = false, Fireworks = 3, Pillar = true },
+	Legendary = { Duration = 6.2, ArmCount = 4, SparkBurst = 36, LightShow = true, LightCount = 6, Shake = 0.2, Quake = false, SkyTint = nil, Confetti = 170, NpcCheer = true, Broadcast = "Server", FovPunch = 8, Orbit = true, Banner = "Epic", CapsuleWobble = 4, HeroShot = true, Lightning = true, Fireworks = 7, Pillar = true },
+	Mythic = { Duration = 8, ArmCount = 6, SparkBurst = 48, LightShow = true, LightCount = 10, Shake = 0.6, Quake = true, SkyTint = Color3.fromRGB(255, 70, 150), Confetti = 260, NpcCheer = true, Broadcast = "Server", FovPunch = 12, Orbit = true, Banner = "Epic", CapsuleWobble = 5, HeroShot = true, Lightning = true, Fireworks = 14, Pillar = true },
 } :: { [string]: Profile }
 
 -- Multipliers applied when the player enabled Low Graphics.
@@ -66,6 +74,7 @@ Sequences.Timings = {
 	ExitRide = 1.4,
 	ClawDrop = 1.2,
 	MarbleRunSpeed = 26, -- studs per second
+	HeroShot = 2.6,
 }
 
 function Sequences.Get(rarity: string?): Profile

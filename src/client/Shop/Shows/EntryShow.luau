@@ -16,6 +16,8 @@ local CameraDirector = require(ShopFolder.CameraDirector)
 local Effects = require(ShopFolder.Effects)
 local Audio = require(ShopFolder.Audio)
 local UI = require(ShopFolder.UI.Components)
+local Cinematics = require(ShopFolder.Cinematics)
+local CollectionService = game:GetService("CollectionService")
 
 local EntryShow = {}
 
@@ -129,6 +131,17 @@ function EntryShow.Play(view)
 	local placed = false
 
 	controller:BeginShow(seq, { Skippable = seen })
+	local cine = Cinematics.Begin({ DepthOfField = false, Bloom = 0.9 })
+	-- neon rings along the glass tube flash as the camera rushes past
+	local rings = {}
+	local entrance = view:Find("Entrance")
+	if entrance then
+		for _, part in entrance:GetDescendants() do
+			if part:IsA("BasePart") and CollectionService:HasTag(part, "FactoryNeon") then
+				table.insert(rings, { Part = part, Color = part.Color, Flashed = false })
+			end
+		end
+	end
 	seq:Run(function(s)
 		controller:SetCharacterHidden(true)
 		Audio.Play("Tube")
@@ -148,6 +161,13 @@ function EntryShow.Play(view)
 			camera.FieldOfView = baseFov + 28 * math.sin(alpha * math.pi)
 			windAttachment.WorldCFrame = CFrame.lookAt(pos + dir * 6, pos) * CFrame.Angles(-math.pi / 2, 0, 0)
 			local roll = if Effects.ReduceMotion() then 0 else math.sin(alpha * math.pi * 3) * 0.08
+			for _, ring in rings do
+				if not ring.Flashed and (ring.Part.Position - pos).Magnitude < 7 then
+					ring.Flashed = true
+					ring.Part.Color = Color3.new(1, 1, 1)
+					TweenService:Create(ring.Part, TweenInfo.new(0.5, Enum.EasingStyle.Quad), { Color = ring.Color }):Play()
+				end
+			end
 			return CFrame.lookAt(pos, pos + dir) * CFrame.Angles(0, 0, roll)
 		end)
 		s:WaitUntil(function()
@@ -166,6 +186,7 @@ function EntryShow.Play(view)
 		CameraDirector.GlideTo(CFrame.lookAt(landing.Position - landing.LookVector * 12 + Vector3.new(0, 6, 0), landing.Position + Vector3.new(0, 1, 0)), 0.45, Enum.EasingStyle.Quad, baseFov)
 		controller:SetCharacterHidden(false)
 		landingEffects(view)
+		cine:Impact(view.Theme.Neon, 0.7)
 		local humanoid = controller:GetHumanoid()
 		if humanoid then
 			humanoid.Jump = true
@@ -173,6 +194,10 @@ function EntryShow.Play(view)
 		s:Wait(0.5)
 	end, function(s)
 		CameraDirector.StopFollow()
+		cine:End()
+		for _, ring in rings do
+			ring.Part.Color = ring.Color
+		end
 		if not s.Cancelled then
 			if not placed then
 				controller:Teleport(landingCFrame(view))

@@ -22,6 +22,10 @@ local Sequence = require(ShopFolder.Sequence)
 local CameraDirector = require(ShopFolder.CameraDirector)
 local Effects = require(ShopFolder.Effects)
 local Audio = require(ShopFolder.Audio)
+local Cinematics = require(ShopFolder.Cinematics)
+local UI = require(ShopFolder.UI.Components)
+local UIFx = require(ShopFolder.UI.UIFx)
+local Theme = require(ShopFolder.UI.Theme)
 
 local PurchaseShow = {}
 
@@ -111,6 +115,8 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 	end
 
 	controller:BeginShow(seq)
+	local cine = Cinematics.Begin({ Bloom = 0.55 + rarity.Rank * 0.08 })
+	cine:Focus(center + Vector3.new(0, 2, 0))
 	seq:Run(function(s)
 		CameraDirector.GlideTo(frontCam, timings.CameraGlide, Enum.EasingStyle.Quint, 60)
 		if not s:Wait(timings.CameraGlide * 0.8) then
@@ -202,6 +208,9 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		if profile.Shake > 0 then
 			CameraDirector.Shake(profile.Shake, profile.Duration)
 		end
+		if profile.Lightning then
+			table.insert(stops, Effects.Lightning(center + Vector3.new(0, 2.5, 0), rarity.Color, 5, 3))
+		end
 		if profile.Orbit and not Effects.ReduceMotion() then
 			local offset = cameraPos - center
 			local radius = Vector3.new(offset.X, 0, offset.Z).Magnitude
@@ -255,6 +264,7 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 						arm.Open = 1
 					end
 					Effects.Burst(goal.Position, "Sparks", profile.SparkBurst, rarity.Color)
+					Effects.FlashLight(goal.Position, Color3.new(1, 1, 1):Lerp(rarity.Color, 0.4), 5, 12, 0.16)
 					Audio.PlayAt("Weld", goal.Position, { Speed = 0.9 + math.random() * 0.4 })
 					remaining -= 1
 					if not s:Wait(perPart * 0.18) then
@@ -280,6 +290,14 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		CameraDirector.StopFollow()
 		CameraDirector.GlideTo(frontCam, 0.4, Enum.EasingStyle.Quad, 60)
 		CameraDirector.Punch(profile.FovPunch)
+		cine:Impact(rarity.Color, 0.6 + rarity.Rank * 0.1)
+		local heroLight = Instance.new("PointLight")
+		heroLight.Color = rarity.Color
+		heroLight.Brightness = 0
+		heroLight.Range = 18
+		heroLight.Shadows = false
+		heroLight.Parent = model.PrimaryPart
+		TweenService:Create(heroLight, TweenInfo.new(0.4), { Brightness = 3 }):Play()
 		Effects.GlowBall(center + Vector3.new(0, 2.5, 0), rarity.Color, 16, 0.6)
 		Effects.Shockwave(center + Vector3.new(0, 0.2, 0), rarity.Color, 18)
 		Effects.Burst(center + Vector3.new(0, 2.5, 0), "Sparks", profile.SparkBurst * 3, rarity.Color)
@@ -293,6 +311,61 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 			model:PivotTo(rootCf * CFrame.Angles(0, ease(alpha) * math.pi * 2, 0) + Vector3.new(0, math.sin(alpha * math.pi) * 1.5, 0))
 		end) then
 			return
+		end
+
+		-- 4b) Hero shot: orbit the finished vacuum with a fan of light behind it
+		if profile.HeroShot and not Effects.ReduceMotion() then
+			cine:Tension(0.03)
+			local fan = Effects.LightFan(center + Vector3.new(0, 2.4, 0), { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) }, 12, 16)
+			table.insert(stops, fan.Stop)
+			local tag = UI.new("BillboardGui", {
+				Name = "HeroTag",
+				Size = UDim2.fromOffset(420, 110),
+				StudsOffset = Vector3.new(0, 6.5, 0),
+				AlwaysOnTop = true,
+				Adornee = model.PrimaryPart,
+				Parent = model,
+			})
+			local name = UI.Label({
+				Text = string.upper(vacuum.Name),
+				Size = UDim2.fromScale(1, 0.62),
+				TextXAlignment = Enum.TextXAlignment.Center,
+				TextScaled = true,
+				FontFace = Theme.Fonts.Title,
+				TextStrokeTransparency = 0.5,
+				Parent = tag,
+			})
+			UI.Gradient({ Color3.new(1, 1, 1), rarity.Color:Lerp(Color3.new(1, 1, 1), 0.3) }, 90).Parent = name
+			UI.Label({
+				Text = rarity.Glyph .. "  " .. string.upper(rarity.Name) .. "  " .. rarity.Glyph,
+				Position = UDim2.fromScale(0, 0.64),
+				Size = UDim2.fromScale(1, 0.3),
+				TextXAlignment = Enum.TextXAlignment.Center,
+				TextScaled = true,
+				FontFace = Theme.Fonts.Title,
+				TextColor3 = rarity.Color,
+				TextStrokeTransparency = 0.5,
+				Parent = tag,
+			})
+			UIFx.Typewriter(name, 0.6)
+			local radius = (cameraPos - center).Magnitude * 0.75
+			local startAngle = math.atan2(cameraPos.Z - center.Z, cameraPos.X - center.X)
+			local heroStart = os.clock()
+			CameraDirector.Follow(function()
+				local t = os.clock() - heroStart
+				local a = startAngle + TweenService:GetValue(math.min(t / timings.HeroShot, 1), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut) * 1.9
+				local pos = center + Vector3.new(math.cos(a) * radius, 3.2 + math.sin(t * 0.8) * 0.6, math.sin(a) * radius)
+				return CFrame.lookAt(pos, center + Vector3.new(0, 2.4, 0))
+			end)
+			local spinStart = model:GetPivot()
+			if not animate(s, timings.HeroShot, function(alpha)
+				model:PivotTo(spinStart * CFrame.Angles(0, alpha * math.pi * 0.6, 0) + Vector3.new(0, math.sin(alpha * math.pi) * 0.8, 0))
+			end) then
+				return
+			end
+			fan.Stop()
+			tag:Destroy()
+			CameraDirector.StopFollow()
 		end
 
 		-- 5) Conveyor to the exit tube
@@ -325,6 +398,8 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 
 		-- 7) The player steps out of the tube
 		local finaleCam = view:ToWorld(config.FinaleCamera)
+		local root = controller:GetRoot()
+		cine:Focus(if root then root else tube)
 		CameraDirector.GlideTo(CFrame.lookAt(finaleCam, tube + Vector3.new(0, 3.5, 0)), 0.5, Enum.EasingStyle.Quint, 55)
 		stepOut(s)
 		s:Wait(timings.Banner)
@@ -332,6 +407,7 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		for _, stop in stops do
 			stop()
 		end
+		cine:End()
 		CameraDirector.StopFollow()
 		if not s.Cancelled then
 			if not state.Placed then
