@@ -22,7 +22,10 @@ function Format.Abbreviate(value: number): string
 	else
 		text = string.format("%.2f", math.floor(scaled * 100) / 100)
 	end
-	text = string.gsub(text, "%.?0+$", "")
+	if string.find(text, ".", 1, true) then
+		-- trim decimals only: "1.50" -> "1.5", "2.00" -> "2", but "100" stays "100"
+		text = string.gsub(text, "%.?0+$", "")
+	end
 	return (if negative then "-" else "") .. text .. SUFFIXES[tier + 1]
 end
 

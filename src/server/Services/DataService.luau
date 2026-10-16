@@ -130,13 +130,10 @@ local function saveProfile(profile: Profile, release: boolean): boolean
 	if not profile.Persistent or not store then
 		return true
 	end
-	if profile.Saving then
-		while profile.Saving do
-			task.wait()
-		end
-		if not release then
-			return true
-		end
+	-- Wait for an in-flight save, then save again ourselves: the caller (e.g.
+	-- ProcessReceipt's ForceSave) needs a save that includes its own changes.
+	while profile.Saving do
+		task.wait()
 	end
 	profile.Saving = true
 	local success = false
