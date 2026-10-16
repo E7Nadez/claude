@@ -49,6 +49,9 @@ function ConfirmModal.new(deps: Deps)
 	self.Deps = deps
 	self.Trove = Trove.new()
 	self.Open = false
+	-- Bumped by every Show: late callbacks (purchase replies, clicks on a card that is still
+	-- shrinking away) only act on the modal they belong to.
+	self.Session = 0
 	self.Gui = UI.new("ScreenGui", {
 		Name = "ShopModal",
 		ResetOnSpawn = false,
@@ -63,6 +66,77 @@ end
 
 function ConfirmModal:IsOpen(): boolean
 	return self.Open
+end
+
+-- Helpers ---------------------------------------------------------------------------
+
+local TEXT_FADE = { "BackgroundTransparency", "TextTransparency", "TextStrokeTransparency" }
+local IMAGE_FADE = { "BackgroundTransparency", "ImageTransparency" }
+local SCROLL_FADE = { "BackgroundTransparency", "ScrollBarImageTransparency" }
+local FRAME_FADE = { "BackgroundTransparency" }
+local STROKE_FADE = { "Transparency" }
+
+local function fadePropsOf(object: Instance): { string }?
+	if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+		return TEXT_FADE
+	elseif object:IsA("ImageLabel") or object:IsA("ImageButton") or object:IsA("ViewportFrame") then
+		return IMAGE_FADE
+	elseif object:IsA("ScrollingFrame") then
+		return SCROLL_FADE
+	elseif object:IsA("GuiObject") then
+		return FRAME_FADE
+	elseif object:IsA("UIStroke") then
+		return STROKE_FADE
+	end
+	return nil
+end
+
+-- Fades a whole card in (from hidden to its built look) or out: text, images, the 3D
+-- preview and every stroke together. No CanvasGroup, which would clip the glow and stamp
+-- and blur the text while the card is zoomed. Fading in skips values that start hidden
+-- (sparkles fade themselves in); fading out overrides every running fade-in.
+local function fadeSubtree(root: Instance, info: TweenInfo, show: boolean)
+	local objects = root:GetDescendants()
+	table.insert(objects, root)
+	for _, object in objects do
+		local props = fadePropsOf(object)
+		if props then
+			local target = object :: any
+			local goal = {}
+			local changed = false
+			for _, prop in props do
+				local value = target[prop]
+				if not show then
+					goal[prop] = 1
+					changed = true
+				elseif value < 1 then
+					goal[prop] = value
+					target[prop] = 1
+					changed = true
+				end
+			end
+			if changed then
+				UI.Tween(object, info, goal)
+			end
+		end
+	end
+end
+
+-- Ends an endless tween (rays, foil) by overriding it with an instant one.
+local function stopLoop(instance: Instance?, property: string)
+	if instance and instance.Parent then
+		UI.Tween(instance, TweenInfo.new(0), { [property] = (instance :: any)[property] })
+	end
+end
+
+-- Same words as the shop's own celebration (ShopController._celebrate).
+local function stampText(item: Shop.ShopItem): string
+	if item.Kind == "Capsule" or item.Kind == "DailyCrate" then
+		return "OPENED!"
+	elseif item.Kind == "Upgrade" then
+		return "UPGRADED!"
+	end
+	return "PURCHASED!"
 end
 
 -- Section builders ------------------------------------------------------------------
@@ -108,8 +182,9 @@ local function statRows(parent: Frame, vacuumId: string, clientData: any)
 			Parent = row,
 		})
 		UI.CountTo(value, 0, (test :: any)[key], 0.7, Format.Stat)
-		UI.Label({
-			Text = if vacuumId == equippedId then "equipped" elseif math.abs(d) < 0.005 then "=" else Format.Percent(d, true),
+		-- Big jumps (starter -> late-game vacuum) read as a multiplier: "x700", not "+69,900%".
+		local deltaLabel = UI.Label({
+			Text = if vacuumId == equippedId then "equipped" elseif math.abs(d) < 0.005 then "=" elseif d >= 9.995 then "x" .. Format.Stat(math.floor(1 + d + 0.5)) else Format.Percent(d, true),
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, 0, 0, 0),
 			Size = UDim2.new(0, 58, 1, 0),
@@ -117,13 +192,15 @@ local function statRows(parent: Frame, vacuumId: string, clientData: any)
 			TextColor3 = color,
 			FontFace = Theme.Fonts.Numbers,
 			TextSize = 14,
+			TextScaled = true,
 			Parent = row,
 		})
+		UI.new("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 9, Parent = deltaLabel })
 	end
 end
 
-local function textRow(parent: Frame, text: string, order: number, color: Color3?)
-	UI.Label({
+local function textRow(parent: Frame, text: string, order: number, color: Color3?): TextLabel
+	return UI.Label({
 		Text = text,
 		RichText = true,
 		Size = UDim2.new(1, 0, 0, 22),
@@ -170,7 +247,8 @@ local function oddsRows(parent: Frame, capsuleId: string, data: any)
 	end
 end
 
-local function detailsFor(item: Shop.ShopItem, parent: Frame, clientData: any)
+-- `tickers` collects refresh functions for the live countdowns (called once a second).
+local function detailsFor(item: Shop.ShopItem, parent: Frame, clientData: any, tickers: { () -> () })
 	local data = clientData:Get()
 	if item.Kind == "Vacuum" then
 		statRows(parent, item.RefId, clientData)
@@ -189,18 +267,30 @@ local function detailsFor(item: Shop.ShopItem, parent: Frame, clientData: any)
 		if upgrade then
 			local level = clientData:UpgradeLevel(item.RefId)
 			local now = (Upgrades.Multiplier(item.RefId, level) - 1)
-			local nextValue = (Upgrades.Multiplier(item.RefId, math.min(level + 1, upgrade.MaxLevel)) - 1)
-			textRow(parent, string.format("Level <b>%d</b> → <b>%d</b>  (max %d)", level, math.min(level + 1, upgrade.MaxLevel), upgrade.MaxLevel), 1)
-			textRow(parent, string.format("%s %s: <b>%s</b> → <font color=\"#40D68C\"><b>%s</b></font>", Stats.Glyphs[upgrade.Stat], Stats.Labels[upgrade.Stat], Format.Percent(now, true), Format.Percent(nextValue, true)), 2)
+			if level >= upgrade.MaxLevel then
+				-- Fully upgraded: no "next level" that does not exist.
+				textRow(parent, string.format("Level <b>%d</b>  (max level)", level), 1, Theme.Colors.Gold)
+				textRow(parent, string.format("%s %s: <b>%s</b>", Stats.Glyphs[upgrade.Stat], Stats.Labels[upgrade.Stat], Format.Percent(now, true)), 2)
+			else
+				local nextValue = (Upgrades.Multiplier(item.RefId, level + 1) - 1)
+				textRow(parent, string.format("Level <b>%d</b> → <b>%d</b>  (max %d)", level, level + 1, upgrade.MaxLevel), 1)
+				textRow(parent, string.format("%s %s: <b>%s</b> → <font color=\"#40D68C\"><b>%s</b></font>", Stats.Glyphs[upgrade.Stat], Stats.Labels[upgrade.Stat], Format.Percent(now, true), Format.Percent(nextValue, true)), 2)
+			end
 		end
 	elseif item.Kind == "Boost" then
 		local boost = Boosts.Get(item.RefId)
 		if boost then
 			textRow(parent, string.format("⏱ Duration: <b>%s</b> (stacks up to %s)", Format.Duration(boost.Duration), Format.Duration(boost.MaxDuration)), 1)
 			local expires = data and data.Boosts[item.RefId] or 0
-			local remaining = expires - workspace:GetServerTimeNow()
-			if remaining > 0 then
-				textRow(parent, "Active: " .. Format.Clock(remaining) .. " left", 2, Theme.Colors.Success)
+			if expires - workspace:GetServerTimeNow() > 0 then
+				local active = textRow(parent, "", 2, Theme.Colors.Success)
+				local function refresh()
+					local remaining = expires - workspace:GetServerTimeNow()
+					active.Text = if remaining > 0 then "Active: " .. Format.Clock(remaining) .. " left" else "Expired"
+					active.TextColor3 = if remaining > 0 then Theme.Colors.Success else Theme.Colors.SubText
+				end
+				refresh()
+				table.insert(tickers, refresh)
 			end
 		end
 	elseif item.Kind == "Cosmetic" then
@@ -234,8 +324,12 @@ local function detailsFor(item: Shop.ShopItem, parent: Frame, clientData: any)
 		textRow(parent, "Possible rewards:", 1, Theme.Colors.SubText)
 		textRow(parent, "🪙 2-6x price in coins  ·  ⚡ boosts  ·  🐾 a pet", 2)
 		textRow(parent, "🎨 a cosmetic  ·  👑 a boss core (rare!)", 3)
-		local now = workspace:GetServerTimeNow()
-		textRow(parent, "New crate in " .. Format.Clock(DayNight.SecondsUntilNextDay(now)), 4, Theme.Colors.SubText)
+		local countdown = textRow(parent, "", 4, Theme.Colors.SubText)
+		local function refresh()
+			countdown.Text = "New crate in " .. Format.Clock(DayNight.SecondsUntilNextDay(workspace:GetServerTimeNow()))
+		end
+		refresh()
+		table.insert(tickers, refresh)
 	end
 end
 
@@ -245,6 +339,18 @@ local function confirmText(item: Shop.ShopItem, state: string): string
 		return "Equip"
 	elseif state == "Equipped" then
 		return if kind == "Cosmetic" then "Unequip" else "Equipped"
+	elseif state == "Owned" then
+		return "Owned"
+	elseif state == "Locked" then
+		return "Locked"
+	elseif state == "NightOnly" then
+		return "At Night"
+	elseif state == "MaxLevel" then
+		return "Maxed"
+	elseif state == "Claimed" then
+		return "Tomorrow"
+	elseif state == "Unavailable" then
+		return "Soon"
 	elseif item.Currency == "Robux" then
 		return "R$ " .. Format.Commas(item.Price)
 	elseif item.Kind == "Capsule" or item.Kind == "DailyCrate" then
@@ -257,8 +363,46 @@ end
 
 -- Preview -----------------------------------------------------------------------------
 
+-- ViewportFrames do not draw Trails, so a trail cosmetic gets a glowing ribbon along the
+-- path the back of the spinning vacuum just swept, fading out like the real trail. Built
+-- in the model's pivot space around the spin axis, so it turns with the model.
+local function trailRibbon(model: Model, cosmetic: any, center: Vector3, size: Vector3)
+	local colors: { Color3 } = cosmetic.Colors or { Color3.new(1, 1, 1) }
+	local segments = if Effects.IsLow() then 6 else 12
+	local span = 1.1 + (cosmetic.Lifetime or 0.6)
+	-- Never taller than the model, so it cannot dip into the turntable.
+	local width = math.min(cosmetic.Width or 1, size.Y * 0.8)
+	local radius = size.Z / 2
+	local pivot = model:GetPivot()
+	local function point(k: number): Vector3
+		local a = -span * k / segments
+		return center + Vector3.new(math.sin(a) * radius, 0, math.cos(a) * radius)
+	end
+	for k = 1, segments do
+		local a, b = point(k - 1), point(k)
+		local f = (k - 0.5) / segments
+		local index = f * (#colors - 1)
+		local lower = math.floor(index)
+		Builder.Part({
+			Name = "TrailRibbon",
+			Size = Vector3.new(0.08, width * (1 - 0.8 * f), (b - a).Magnitude + 0.04),
+			CFrame = pivot * CFrame.lookAt((a + b) / 2, b),
+			Color = colors[lower + 1]:Lerp(colors[math.min(lower + 2, #colors)], index - lower),
+			Material = Enum.Material.Neon,
+			Transparency = 0.1 + 0.85 * f,
+			CastShadow = false,
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			Parent = model,
+		})
+	end
+end
+
 local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
+	local calm = Effects.ReduceMotion()
 	local model: Model? = nil
+	local trail = nil
 	if item.Kind == "Vacuum" then
 		model = VacuumModel.Build(item.RefId)
 	elseif item.Kind == "Trophy" then
@@ -268,8 +412,14 @@ local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
 		end
 	elseif item.Kind == "Cosmetic" then
 		local cosmetic = Cosmetics.Get(item.RefId)
-		local vacuumId = self.Deps.ClientData:Equipped()
-		model = VacuumModel.Build(vacuumId, { Skin = if cosmetic and cosmetic.Slot == "Skin" then cosmetic.Id else nil })
+		local clientData = self.Deps.ClientData
+		local data = clientData:Get()
+		-- On the player's own vacuum: a skin repaints it, a trail keeps the paint it has.
+		local equippedSkin = if data and data.Cosmetics then data.Cosmetics.Skin else nil
+		model = VacuumModel.Build(clientData:Equipped(), { Skin = if cosmetic and cosmetic.Slot == "Skin" then cosmetic.Id else equippedSkin })
+		if cosmetic and cosmetic.Slot == "Trail" then
+			trail = cosmetic
+		end
 	end
 	if not model then
 		UI.Icon({ Glyph = item.Glyph, Rarity = item.Rarity, IconAssetId = item.IconAssetId, Size = UDim2.fromScale(0.9, 0.9), Position = UDim2.fromScale(0.05, 0.05), Parent = holder })
@@ -286,7 +436,15 @@ local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
 	}, { UI.Corner(Theme.Radius.Large), UI.Stroke(rarity.Color, 0.3, 2) })
 	UI.Gradient(Rarities.ColorSequence(rarity.Id), 135, NumberSequence.new(0.78)).Parent = stage
 	UIFx.Glow(stage, rarity.Color, 0.95, 0.9)
-	UIFx.Rays(stage, rarity.Color, { Count = 8, Speed = 16, Size = 1, Transparency = if rarity.Rank >= 5 then 0.55 else 0.75 })
+	local rays = UIFx.Rays(stage, rarity.Color, { Count = 8, Speed = 16, Size = 1, Transparency = if rarity.Rank >= 5 then 0.55 else 0.75 })
+	-- Still rays under Reduce Motion; otherwise the endless spin ends with the modal.
+	if calm then
+		stopLoop(rays, "Rotation")
+	else
+		self.Trove:Add(function()
+			stopLoop(rays, "Rotation")
+		end)
+	end
 	local viewport = UI.new("ViewportFrame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -297,21 +455,34 @@ local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
 		Parent = holder,
 	})
 	if rarity.Rank >= 5 then
-		self.Trove:Add(UIFx.Sparkles(holder, rarity.Color, 6))
+		local stopSparkles = UIFx.Sparkles(holder, rarity.Color, 6)
+		self.Trove:Add(stopSparkles)
+		-- No new sparkle pops in while the card fades out.
+		self.StopSparkles = stopSparkles
 	end
 	local camera = Instance.new("Camera")
 	camera.FieldOfView = 38
 	camera.Parent = viewport
 	viewport.CurrentCamera = camera
 	model.Parent = viewport
-	local size = model:GetExtentsSize()
-	local radius = math.max(size.X, size.Y, size.Z)
-	local center = Vector3.new(0, size.Y / 2, 0)
+	-- Models pivot on their Root, which is neither centred nor always at the bottom: spin
+	-- around the middle of the bounding box, with its base resting on the turntable.
+	local boxCf, size = model:GetBoundingBox()
+	local center = model:GetPivot():PointToObjectSpace(boxCf.Position)
+	local base = CFrame.new(-center.X, size.Y / 2 - center.Y, -center.Z)
+	if trail then
+		trailRibbon(model, trail, center, size)
+	end
+	local extent = math.max(size.X, size.Y, size.Z)
+	-- The plate fits the footprint the model sweeps while it turns.
+	local plate = math.max(math.sqrt(size.X ^ 2 + size.Z ^ 2) / 2 * 1.08, extent * 0.3)
+	-- The bob only lifts the model off the plate, never into it.
+	local bob = if calm then 0 else extent * 0.035
 	-- Glowing turntable under the model
 	Builder.Part({
 		Name = "Turntable",
 		Shape = Enum.PartType.Cylinder,
-		Size = Vector3.new(0.2, radius * 1.15, radius * 1.15),
+		Size = Vector3.new(0.2, plate * 2, plate * 2),
 		CFrame = CFrame.new(0, -0.1, 0) * CFrame.Angles(0, 0, math.pi / 2),
 		Color = rarity.Color:Lerp(Color3.new(0, 0, 0), 0.55),
 		Material = Enum.Material.SmoothPlastic,
@@ -320,21 +491,31 @@ local function buildPreview(self, item: Shop.ShopItem, holder: Frame)
 	Builder.Part({
 		Name = "Rim",
 		Shape = Enum.PartType.Cylinder,
-		Size = Vector3.new(0.12, radius * 1.22, radius * 1.22),
+		Size = Vector3.new(0.12, plate * 2.12, plate * 2.12),
 		CFrame = CFrame.new(0, -0.14, 0) * CFrame.Angles(0, 0, math.pi / 2),
 		Color = rarity.Color,
 		Material = Enum.Material.Neon,
 		Parent = viewport,
 	})
+	-- Frame the whole stage (rim and the model at the top of its bob) with its bounding
+	-- sphere, so the square viewport never cuts it from any angle of the camera sway.
+	local bottom, top = -0.2, 0.04 + bob + size.Y
+	local focus = Vector3.new(0, (bottom + top) / 2, 0)
+	local sphere = math.sqrt((plate * 1.06) ^ 2 + ((top - bottom) / 2) ^ 2)
+	local distance = sphere / math.sin(math.rad(camera.FieldOfView / 2)) * 1.03
 	local angle = 0
 	local t = 0
-	self.Trove:Connect(RunService.RenderStepped, function(dt)
+	local function step(dt: number)
 		angle += dt * 0.8
 		t += dt
-		model:PivotTo(CFrame.new(0, 0.05 + math.sin(t * 1.6) * 0.06 * radius, 0) * CFrame.Angles(0, angle, 0))
-		local lift = radius * (0.3 + math.sin(t * 0.7) * 0.06)
-		camera.CFrame = CFrame.lookAt(center + Vector3.new(math.sin(t * 0.4) * radius * 0.15, lift, radius * 1.7), center)
-	end)
+		model:PivotTo(CFrame.new(0, 0.04 + bob * (0.5 + 0.5 * math.sin(t * 1.6)), 0) * CFrame.Angles(0, angle, 0) * base)
+		-- Reduce Motion: a fixed camera (the slow turn stays).
+		local sway = if calm then 0 else t
+		local direction = Vector3.new(math.sin(sway * 0.4) * 0.09, 0.2 + math.sin(sway * 0.7) * 0.035, 1).Unit
+		camera.CFrame = CFrame.lookAt(focus + direction * distance, focus)
+	end
+	step(0)
+	self.Trove:Connect(RunService.RenderStepped, step)
 end
 
 -- Show ----------------------------------------------------------------------------------
@@ -344,10 +525,26 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	local opts = options or {}
 	local deps = self.Deps
 	local clientData = deps.ClientData
+	local calm = Effects.ReduceMotion()
+	self.Session += 1
+	local session = self.Session
 	self.Open = true
 	self.Item = item
 	self.Gui.Enabled = true
+	-- Gamepad: the selection goes back here when the modal closes.
+	local selected = GuiService.SelectedObject
+	self.PrevSelection = if selected and not selected:IsDescendantOf(self.Gui) then selected else nil
 	Audio.Play("Open")
+
+	-- Closing by the player (Cancel, ✕, backdrop, B / Backspace). Ignored while a purchase
+	-- request is in flight (it would still go through, unseen) and for clicks on an older
+	-- modal that is still shrinking away.
+	local busy = false
+	local function closeByPlayer()
+		if self.Session == session and self.Open and not busy then
+			self:Close()
+		end
+	end
 
 	local backdrop = UI.new("TextButton", {
 		Name = "Backdrop",
@@ -360,9 +557,15 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		Parent = self.Gui,
 	})
 	self.Trove:Add(backdrop)
+	self.Backdrop = backdrop
 	UI.Tween(backdrop, Theme.Tween.Medium, { BackgroundTransparency = 0.45 })
+	local openedAt = os.clock()
 	backdrop.Activated:Connect(function()
-		self:Close()
+		-- The second click of a double-click on a shop card lands here while the card is
+		-- still flying to the centre: that is not a request to close.
+		if os.clock() - openedAt >= 0.4 then
+			closeByPlayer()
+		end
 	end)
 
 	local holder = UI.new("Frame", {
@@ -383,13 +586,22 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	self.Trove:Connect(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), fit)
 
 	local rarity = Rarities.Get(item.Rarity)
+	-- Centre-anchored, so its zoom (PopScale) stays centred on the holder.
 	local card = UI.Glass({
 		Name = "Card",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 0.04,
 		StrokeColor = rarity.Color,
 		StrokeTransparency = 0.35,
 		Active = true,
+		-- Gamepad selection cannot wander to the shop grid behind the modal.
+		SelectionGroup = true,
+		SelectionBehaviorUp = Enum.SelectionBehavior.Stop,
+		SelectionBehaviorDown = Enum.SelectionBehavior.Stop,
+		SelectionBehaviorLeft = Enum.SelectionBehavior.Stop,
+		SelectionBehaviorRight = Enum.SelectionBehavior.Stop,
 		Parent = holder,
 	})
 	self.Card = card
@@ -398,20 +610,26 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	cardStroke.Thickness = 2
 	UI.Gradient(Rarities.ColorSequence(rarity.Id), 0).Parent = cardStroke
 	if rarity.Rank >= 4 then
-		UIFx.Foil(card, rarity.Id, Theme.Radius.Large, 0.1)
+		local foil = UIFx.Foil(card, rarity.Id, Theme.Radius.Large, 0.1)
+		self.Trove:Add(function()
+			stopLoop(foil:FindFirstChildOfClass("UIGradient"), "Offset")
+		end)
 	end
 	local scale = UI.GetScale(card)
-	-- Morph out of the card that was clicked (if any)
+	-- Morph out of the card that was clicked (if any). Position and zoom only: a rotated
+	-- ancestor would switch off the buttons' clipping (their parked shine bars would show).
 	local from = opts.FromGui
 	self.FromGui = from
-	if typeof(from) == "Instance" and from:IsA("GuiObject") and from.AbsoluteSize.X > 0 then
+	if not calm and typeof(from) == "Instance" and from:IsA("GuiObject") and from.AbsoluteSize.X > 0 then
 		local center = Effects.GuiCenter(from)
 		holder.Position = UDim2.fromOffset(center.X, center.Y)
 		scale.Scale = math.clamp(from.AbsoluteSize.X / (560 * math.max(autoScale.Scale, 0.01)), 0.15, 0.9)
-		card.Rotation = -4
 		UI.Tween(holder, TweenInfo.new(0.42, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Position = UDim2.fromScale(0.5, 0.5) })
 		UI.Tween(scale, TweenInfo.new(0.48, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
-		UI.Tween(card, TweenInfo.new(0.48, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Rotation = 0 })
+	elseif calm then
+		-- Reduce Motion: no flight and no overshoot, just a fade with a hint of zoom.
+		scale.Scale = 0.96
+		UI.Tween(scale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 })
 	else
 		scale.Scale = 0.82
 		UI.Tween(scale, Theme.Tween.Open, { Scale = 1 })
@@ -468,7 +686,8 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		ScrollBarImageColor3 = Theme.Colors.SubText,
 		Parent = card,
 	}, { UI.List(Enum.FillDirection.Vertical, 6) })
-	detailsFor(item, details, clientData)
+	local tickers: { () -> () } = {}
+	detailsFor(item, details, clientData, tickers)
 
 	-- Footer: state + price + buttons
 	local data = clientData:Get()
@@ -482,6 +701,9 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	local priceText
 	if state == "Owned" or state == "Equipped" then
 		priceText = "✔ Owned"
+	elseif state == "MaxLevel" then
+		-- Not the price of a level that does not exist.
+		priceText = "MAX LEVEL"
 	elseif item.Currency == "Robux" then
 		priceText = "R$ " .. Format.Commas(price)
 	else
@@ -489,32 +711,53 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 	end
 	local priceLabel = UI.Label({
 		Text = priceText,
-		Size = UDim2.new(0.55, 0, 0, 30),
+		Size = UDim2.new(0.5, 0, 0, 30),
 		FontFace = Theme.Fonts.Numbers,
 		TextSize = 26,
-		TextColor3 = if state == "Owned" or state == "Equipped" then Theme.Colors.Success elseif affordable then Theme.Colors.Gold else Theme.Colors.Danger,
+		TextColor3 = if state == "Owned" or state == "Equipped" then Theme.Colors.Success elseif state == "MaxLevel" or affordable then Theme.Colors.Gold else Theme.Colors.Danger,
 		Parent = footer,
 	})
 	UI.Pop(priceLabel, 0.1)
-	local infoText = ""
-	if state == "Locked" or state == "NightOnly" or state == "Unavailable" or state == "MaxLevel" then
-		infoText = "🔒 " .. (reason or state)
-	elseif state == "Claimed" then
-		infoText = "Claimed today · next in " .. Format.Clock(DayNight.SecondsUntilNextDay(workspace:GetServerTimeNow()))
-	elseif item.Currency ~= "Robux" and state == "Available" then
-		infoText = if affordable then "Balance after: " .. Format.Abbreviate(balance - price) else "You need " .. Format.Abbreviate(price - balance) .. " more"
+	local function infoText(): string
+		if state == "Locked" or state == "NightOnly" or state == "Unavailable" then
+			return "🔒 " .. (reason or state)
+		elseif state == "Claimed" then
+			return "Next crate in " .. Format.Clock(DayNight.SecondsUntilNextDay(workspace:GetServerTimeNow()))
+		elseif item.Currency ~= "Robux" and state == "Available" then
+			return if affordable then "Balance after: " .. Format.Abbreviate(balance - price) else "You need " .. Format.Abbreviate(price - balance) .. " more"
+		end
+		return ""
 	end
-	UI.Label({
+	-- Shrinks long lock reasons to fit instead of cutting them off.
+	local info = UI.Label({
 		Name = "Info",
-		Text = infoText,
+		Text = infoText(),
 		AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, 0, 0, 4),
-		Size = UDim2.new(0.45, 0, 0, 24),
+		Size = UDim2.new(0.5, 0, 0, 24),
 		TextXAlignment = Enum.TextXAlignment.Right,
 		TextColor3 = if state == "Available" and affordable then Theme.Colors.SubText else Theme.Colors.Warning,
 		TextSize = 15,
+		TextScaled = true,
 		Parent = footer,
 	})
+	UI.new("UITextSizeConstraint", { MaxTextSize = 15, MinTextSize = 10, Parent = info })
+	if state == "Claimed" then
+		table.insert(tickers, function()
+			info.Text = infoText()
+		end)
+	end
+	-- Live countdowns (boost time left, next daily crate)
+	if #tickers > 0 then
+		self.Trove:Add(task.spawn(function()
+			while true do
+				task.wait(1)
+				for _, refresh in tickers do
+					refresh()
+				end
+			end
+		end))
+	end
 	local errorLabel = UI.Label({
 		Name = "Error",
 		Text = "",
@@ -533,14 +776,15 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		Position = UDim2.new(0, 0, 1, 0),
 		Size = UDim2.new(0.38, -6, 0, 54),
 		Parent = footer,
-		OnClick = function()
-			self:Close()
-		end,
+		OnClick = closeByPlayer,
 	})
 
 	local kind: string = item.Kind
 	local equipable = kind == "Vacuum" or kind == "Cosmetic"
 	local canConfirm = state == "Available" or (state == "Owned" and equipable) or (state == "Equipped" and kind == "Cosmetic")
+	-- One request per modal: a double click must not buy twice (or equip and unequip again).
+	local submitted = false
+	local shakeReady = 0
 	local confirm: UI.Button
 	confirm = UI.Button({
 		Name = "Confirm",
@@ -553,35 +797,79 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		Enabled = canConfirm and (affordable or state ~= "Available"),
 		Parent = footer,
 		OnClick = function()
+			-- Also ignores a click that reaches this card while it is closing.
+			if submitted or self.Session ~= session or not self.Open then
+				return
+			end
+			submitted = true
+			busy = true
+			cancel:SetEnabled(false)
 			confirm:SetLoading(true)
 			errorLabel.Text = ""
+			-- A request that never answers must not trap the player in the modal.
+			self.Trove:Add(task.delay(6, function()
+				if busy then
+					busy = false
+					cancel:SetEnabled(true)
+				end
+			end))
 			local result
 			if state == "Available" then
 				result = deps.Purchase(item, opts.Source or "Classic")
 			else
 				result = deps.Equip(item)
 			end
-			if not self.Open or self.Item ~= item then
+			if self.Session ~= session or not self.Open then
 				return
 			end
+			busy = false
 			confirm:SetLoading(false)
 			if result.Ok then
 				if opts.OnResult then
 					task.spawn(opts.OnResult, result)
 				end
-				confirm:SetStyle("Success")
-				confirm:SetText("✔")
-				UI.Pop(confirm.Instance, 0.2)
-				UIFx.Burst(Effects.Layer(), Effects.GuiCenter(confirm.Instance), Theme.Colors.Success, 20, 120)
-				if state == "Available" then
-					UIFx.Stamp(card, if result.Pending then "CHECKOUT…" else "PURCHASED!", rarity.Color:Lerp(Color3.new(1, 1, 1), 0.25), 0.5)
+				-- Extra clicks on the result do nothing (no error shake either).
+				confirm.Instance.Interactable = false
+				local hold = 0.25
+				if result.Pending then
+					-- Roblox shows its own purchase prompt now; nothing is bought until the
+					-- player confirms it there, so no success effects here.
+					confirm:SetText("Checkout…")
+					hold = 0.3
+				else
+					confirm:SetStyle("Success")
+					confirm:SetText("✔")
+					UI.Pop(confirm.Instance, 0.2)
+					UIFx.Burst(Effects.Layer(), Effects.GuiCenter(confirm.Instance), Theme.Colors.Success, 20, 120)
+					-- Opened from a shop card, the modal shrinks back into it and that card
+					-- celebrates (stamp, reveal); anywhere else the modal shows the stamp.
+					local handOff = typeof(from) == "Instance" and from.Parent ~= nil
+					if state == "Available" and not handOff and not calm then
+						UIFx.Stamp(card, stampText(item), rarity.Color:Lerp(Color3.new(1, 1, 1), 0.25), 0.5)
+						hold = 0.45
+					end
 				end
-				task.wait(0.55)
-				self:Close()
+				-- Short hold: the celebration waits for the modal to get out of the way.
+				task.wait(hold)
+				if self.Session == session and self.Open then
+					self:Close()
+				end
 			else
+				submitted = false
+				cancel:SetEnabled(true)
 				errorLabel.Text = result.Error or "Something went wrong."
-				UI.Shake(card)
+				if calm then
+					errorLabel.TextTransparency = 1
+					UI.Tween(errorLabel, Theme.Tween.Medium, { TextTransparency = 0 })
+				elseif os.clock() >= shakeReady then
+					-- One shake at a time (a shake started mid-shake would keep its offset).
+					shakeReady = os.clock() + 0.25
+					UI.Shake(card)
+				end
 				Audio.Play("Error")
+				if UserInputService.GamepadEnabled and GuiService.SelectedObject == nil then
+					GuiService.SelectedObject = confirm.Instance
+				end
 			end
 		end,
 	})
@@ -604,25 +892,35 @@ function ConfirmModal:Show(item: Shop.ShopItem, options: { [string]: any }?)
 		Position = UDim2.new(1, -14, 0, 14),
 		Radius = Theme.Radius.Pill,
 		Parent = card,
-		OnClick = function()
-			self:Close()
-		end,
+		OnClick = closeByPlayer,
 	})
 
+	-- Unbound in Close (not by the delayed cleanup, which would unbind a newer modal's action).
 	ContextActionService:BindActionAtPriority("ShopModalBack", function(_, inputState)
 		if inputState == Enum.UserInputState.Begin then
-			self:Close()
+			closeByPlayer()
 		end
 		return Enum.ContextActionResult.Sink
 	end, false, Enum.ContextActionPriority.High.Value + 5, Enum.KeyCode.ButtonB, Enum.KeyCode.Backspace)
-	self.Trove:Add(function()
-		ContextActionService:UnbindAction("ShopModalBack")
-	end)
 	if UserInputService.GamepadEnabled then
 		GuiService.SelectedObject = if confirm.Enabled then confirm.Instance else cancel.Instance
 	end
 	self.Trove:Add(confirm)
 	self.Trove:Add(cancel)
+
+	-- The whole card fades in with its zoom: text, 3D preview, strokes and buttons together.
+	fadeSubtree(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), true)
+end
+
+-- Whether the gamepad selection can go back to `object` once the modal is gone.
+local function canRestoreSelection(object: GuiObject, modalGui: ScreenGui): boolean
+	local screen = object:FindFirstAncestorOfClass("ScreenGui")
+	return screen ~= nil
+		and screen ~= modalGui
+		and screen.Enabled
+		and screen:IsDescendantOf(Players.LocalPlayer)
+		and object.Visible
+		and object.Selectable
 end
 
 function ConfirmModal:Close(immediate: boolean?)
@@ -631,40 +929,55 @@ function ConfirmModal:Close(immediate: boolean?)
 	end
 	self.Open = false
 	self.Item = nil
+	ContextActionService:UnbindAction("ShopModalBack")
 	if not immediate then
 		Audio.Play("Close")
 	end
 	local card = self.Card
+	local holder = self.Holder
+	local backdrop = self.Backdrop
 	local trove = self.Trove
+	local session = self.Session
 	self.Trove = Trove.new()
+	self.Card = nil
+	self.Holder = nil
+	self.Backdrop = nil
 	local from = self.FromGui
 	self.FromGui = nil
-	if card and not immediate then
-		if typeof(from) == "Instance" and from.Parent and (from :: GuiObject).AbsoluteSize.X > 0 and self.Holder then
+	if self.StopSparkles then
+		self.StopSparkles()
+		self.StopSparkles = nil
+	end
+	-- Gamepad: back to what was selected before the modal opened (the card's Buy button).
+	local previous = self.PrevSelection
+	self.PrevSelection = nil
+	local selected = GuiService.SelectedObject
+	if selected and selected:IsDescendantOf(self.Gui) then
+		GuiService.SelectedObject = if previous and canRestoreSelection(previous, self.Gui) then previous else nil
+	end
+	if card and holder and backdrop and not immediate then
+		local calm = Effects.ReduceMotion()
+		if not calm and typeof(from) == "Instance" and from:IsA("GuiObject") and from.Parent and from.AbsoluteSize.X > 0 then
 			-- shrink back into the card it came from
 			local center = Effects.GuiCenter(from :: GuiObject)
-			UI.Tween(self.Holder, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.fromOffset(center.X, center.Y) })
+			UI.Tween(holder, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.fromOffset(center.X, center.Y) })
 			UI.Tween(UI.GetScale(card), TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.25 })
-			UI.Tween(card, TweenInfo.new(0.22), { BackgroundTransparency = 1 })
 		else
-			UI.Tween(UI.GetScale(card), Theme.Tween.Close, { Scale = 0.85 })
+			UI.Tween(UI.GetScale(card), Theme.Tween.Close, { Scale = if calm then 0.96 else 0.85 })
 		end
-		local backdrop = self.Gui:FindFirstChild("Backdrop")
-		if backdrop then
-			UI.Tween(backdrop, Theme.Tween.Close, { BackgroundTransparency = 1 })
-		end
+		-- Everything on the card fades out with it, not just its background.
+		fadeSubtree(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), false)
+		UI.Tween(backdrop, Theme.Tween.Close, { BackgroundTransparency = 1 })
 		task.delay(0.22, function()
 			trove:Clean()
-			if not self.Open then
+			-- A modal opened (and maybe closed) meanwhile owns the ScreenGui now.
+			if not self.Open and self.Session == session then
 				self.Gui.Enabled = false
 			end
 		end)
 	else
 		trove:Clean()
 		self.Gui.Enabled = false
-	end
-	if GuiService.SelectedObject and GuiService.SelectedObject:IsDescendantOf(self.Gui) then
-		GuiService.SelectedObject = nil
 	end
 end
 
