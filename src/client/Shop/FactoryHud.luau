@@ -1,6 +1,7 @@
 -- Slim, semi-transparent HUD on the screen edges while inside the factory:
 -- zone quick-travel (left), contextual item panel (right on desktop, bottom on
--- phones), carousel arrows, back button and input hints.
+-- phones), carousel arrows, back button and input hints. The edge elements
+-- slide in and out; _layout fits them to the viewport.
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -16,6 +17,7 @@ local Trove = require(Shared.Util.Trove)
 local Theme = require(script.Parent.UI.Theme)
 local UI = require(script.Parent.UI.Components)
 local Audio = require(script.Parent.Audio)
+local Effects = require(script.Parent.Effects)
 
 local FactoryHud = {}
 FactoryHud.__index = FactoryHud
@@ -32,12 +34,60 @@ export type PanelSpec = {
 	Bars: { { Label: string, Fill: number, Ghost: number?, Value: string, Delta: number? } }?,
 }
 
+-- Nav cell and gap (before the nav's own scale)
+local NAV_CELL = Vector2.new(64, 56)
+local NAV_GAP = 8
+-- Below this nav scale the 10 px captions would render under 8 px (phones):
+-- the icons stand alone there.
+local CAPTION_MIN_SCALE = 0.8
+
+-- Rough height of a panel's text column. Body text is 15 px (18 px lines) and
+-- wraps at about 7.5 px per character; anything taller scrolls.
+local function columnHeight(spec: PanelSpec, width: number): number
+	local perLine = math.max(math.floor(width / 7.5), 1)
+	local function wrapped(text: string): number
+		local plain = string.gsub(text, "<[^>]+>", "")
+		return 18 * math.max(math.ceil((utf8.len(plain) or #plain) / perLine), 1)
+	end
+	local height, count = 30, 1
+	if spec.Rarity or spec.Kicker then
+		height += 20
+		count += 1
+	end
+	if spec.Bars then
+		height += #spec.Bars * 20
+		count += #spec.Bars
+	end
+	if spec.Lines then
+		for _, line in spec.Lines do
+			height += wrapped(line)
+			count += 1
+		end
+	end
+	if spec.Status then
+		height += math.max(wrapped(spec.Status), 20)
+		count += 1
+	end
+	return height + (count - 1) * 6
+end
+
 function FactoryHud.new(deps)
 	local self = setmetatable({}, FactoryHud)
-	self.Deps = deps -- { OnTravel(zoneId), OnClassic(), OnExit() }
+	self.Deps = deps -- { OnTravel(zoneId), OnClassic(), OnExit(), OnNavChanged(visible, inset)? }
 	self.PanelTrove = Trove.new()
 	self.Visible = false
 	self.Buttons = {}
+	-- Edge elements: { rest, away } spots from _layout, running moves, slide tokens
+	self.Spots = {} :: { [GuiObject]: { UDim2 } }
+	self.Moves = {} :: { [GuiObject]: Tween }
+	self.SlideTokens = {} :: { [GuiObject]: number }
+	self.Hiding = {} :: { [GuiObject]: boolean }
+	self.NavShown = true
+	self.BackShown = false
+	self.CarouselShown = false
+	self.PanelShown = false
+	self.PanelNeed = 440
+	self.NavInset = 0
 
 	local gui = UI.new("ScreenGui", {
 		Name = "FactoryHud",
@@ -50,24 +100,37 @@ function FactoryHud.new(deps)
 	})
 	self.Gui = gui
 
-	-- Zone navigation
+	-- Zone navigation: one column, or two on short phone screens (_layout fits
+	-- it between the top bar and the Back button)
 	local nav = UI.new("Frame", {
 		Name = "Nav",
 		AnchorPoint = Vector2.new(0, 0.5),
 		Position = UDim2.new(0, 14, 0.5, 20),
-		Size = UDim2.fromOffset(64, 520),
+		Size = UDim2.fromOffset(NAV_CELL.X, 520),
 		BackgroundTransparency = 1,
 		Parent = gui,
-	}, { UI.List(Enum.FillDirection.Vertical, 8, Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center) })
-	UI.AutoScale(nav)
+	})
+	self.NavGrid = UI.new("UIGridLayout", {
+		CellSize = UDim2.fromOffset(NAV_CELL.X, NAV_CELL.Y),
+		CellPadding = UDim2.fromOffset(NAV_GAP, NAV_GAP),
+		FillDirection = Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = nav,
+	})
+	self.NavScale = UI.new("UIScale", { Name = "AutoScale", Parent = nav })
 	self.Nav = nav
 	self.NavButtons = {}
+	self.NavCaptions = {}
+	self.NavCount = 0
 	local function navButton(id: string, glyph: string, label: string, order: number, style: string?, onClick: () -> ())
-		local holder = UI.new("Frame", { Name = id, Size = UDim2.fromOffset(56, 56), BackgroundTransparency = 1, LayoutOrder = order, Parent = nav })
+		local holder = UI.new("Frame", { Name = id, Size = UDim2.fromOffset(NAV_CELL.X, NAV_CELL.Y), BackgroundTransparency = 1, LayoutOrder = order, Parent = nav })
+		-- Icon-only: the icon goes in as Text (Glyph adds a spacer that shrinks and
+		-- off-centres it); the centred anchor keeps hover/press scaling in place.
 		local button = UI.Button({
-			Glyph = glyph,
-			Text = "",
+			Text = glyph,
 			Style = style or "Ghost",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
 			Size = UDim2.fromScale(1, 1),
 			Radius = Theme.Radius.Large,
 			TextSize = 26,
@@ -79,7 +142,7 @@ function FactoryHud.new(deps)
 			Text = string.upper(label),
 			AnchorPoint = Vector2.new(0.5, 1),
 			Position = UDim2.new(0.5, 0, 1, -3),
-			Size = UDim2.new(1, 0, 0, 11),
+			Size = UDim2.new(1, -8, 0, 12),
 			TextXAlignment = Enum.TextXAlignment.Center,
 			TextScaled = true,
 			FontFace = Theme.Fonts.Title,
@@ -89,6 +152,8 @@ function FactoryHud.new(deps)
 		})
 		UI.new("UITextSizeConstraint", { MaxTextSize = 10, Parent = caption })
 		self.NavButtons[id] = button
+		self.NavCount += 1
+		table.insert(self.NavCaptions, { Caption = caption, Label = button.Label })
 		return button
 	end
 	for i, zone in Factory.Zones do
@@ -119,6 +184,8 @@ function FactoryHud.new(deps)
 		Text = "Back",
 		Glyph = "←",
 		Style = "Secondary",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromScale(1, 1),
 		Radius = Theme.Radius.Pill,
 		Parent = backHolder,
@@ -146,7 +213,8 @@ function FactoryHud.new(deps)
 		Text = "◀",
 		Style = "Primary",
 		Size = UDim2.fromOffset(58, 58),
-		Position = UDim2.fromOffset(4, 4),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 33, 0.5, 0),
 		Radius = Theme.Radius.Pill,
 		TextSize = 24,
 		Parent = carousel,
@@ -160,8 +228,8 @@ function FactoryHud.new(deps)
 		Text = "▶",
 		Style = "Primary",
 		Size = UDim2.fromOffset(58, 58),
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -4, 0, 4),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(1, -33, 0.5, 0),
 		Radius = Theme.Radius.Pill,
 		TextSize = 24,
 		Parent = carousel,
@@ -183,6 +251,7 @@ function FactoryHud.new(deps)
 		Parent = carousel,
 	})
 
+	-- (placed above the carousel / panel by _layout)
 	self.Hint = UI.Label({
 		Name = "Hint",
 		Text = "",
@@ -193,8 +262,10 @@ function FactoryHud.new(deps)
 		TextColor3 = Theme.Colors.SubText,
 		TextStrokeTransparency = 0.6,
 		TextSize = 14,
+		Visible = false,
 		Parent = gui,
 	})
+	UI.AutoScale(self.Hint)
 
 	-- Context panel container
 	self.PanelHolder = UI.new("Frame", {
@@ -204,20 +275,206 @@ function FactoryHud.new(deps)
 		Parent = gui,
 	})
 	self.PanelScale = UI.AutoScale(self.PanelHolder)
+
+	self:_layout(true)
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		self:_layout(true)
+	end)
+	GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(function()
+		self:_layout(true)
+	end)
 	return self
 end
+
+-- Layout & motion --------------------------------------------------------------------------
+
+-- Fits the edge elements to the viewport and the current state: the nav between
+-- the top bar (this gui ignores its inset) and the Back button; on phones Back,
+-- panel and carousel share the bottom edge (the carousel under the right thumb,
+-- clear of the toasts at the top); the hint above whatever is under it.
+-- snap: the viewport changed, elements jump to their new spots.
+function FactoryHud:_layout(snap: boolean?)
+	local viewport = workspace.CurrentCamera.ViewportSize
+	local scale = UI.ScaleFor(viewport)
+	local compact = UI.IsCompact()
+	local top = GuiService:GetGuiInset().Y + 8
+
+	-- Nav: as many rows as fit at the auto scale, balanced over the columns
+	local bottom = viewport.Y - (16 + 54 * scale + 10)
+	local room = math.max(bottom - top, 1)
+	local count = math.max(self.NavCount, 1)
+	local rows = math.clamp(math.floor((room / scale + NAV_GAP) / (NAV_CELL.Y + NAV_GAP)), 1, count)
+	local columns = math.ceil(count / rows)
+	rows = math.ceil(count / columns)
+	local width = columns * NAV_CELL.X + (columns - 1) * NAV_GAP
+	local height = rows * NAV_CELL.Y + (rows - 1) * NAV_GAP
+	local navScale = math.min(scale, room / height)
+	local half = height * navScale / 2
+	local navY = math.round(math.clamp(viewport.Y / 2 + 20, top + half, math.max(bottom - half, top + half)))
+	local navWidth = math.ceil(width * navScale)
+	self.NavGrid.FillDirectionMaxCells = rows
+	self.Nav.Size = UDim2.fromOffset(width, height)
+	self.NavScale.Scale = navScale
+	self.NavInset = 14 + navWidth + 12
+	self.Spots[self.Nav] = { UDim2.fromOffset(14, navY), UDim2.fromOffset(-navWidth - 16, navY) }
+	local captions = navScale >= CAPTION_MIN_SCALE
+	for _, entry in self.NavCaptions do
+		entry.Caption.Visible = captions
+		entry.Label.Position = if captions then UDim2.fromOffset(0, -5) else UDim2.new()
+	end
+
+	self.Spots[self.BackHolder] = { UDim2.new(0, 16, 1, -16), UDim2.new(0, -math.ceil(140 * scale) - 16, 1, -16) }
+
+	local holder = self.PanelHolder
+	-- (a panel that is sliding out keeps its shape)
+	local reshape = not self.Hiding[holder]
+	local carouselHeight = 66 * scale
+	local carouselAway = math.ceil(carouselHeight) + 8
+	local hintX: UDim
+	local hintBottom: number
+	if compact then
+		local left = 16 + 140 * scale + 12
+		local beside = viewport.X - (16 + 300 * scale + 12)
+		local besideFits = beside - left >= 320 * scale
+		local right = if self.CarouselShown and besideFits then beside else viewport.X - left
+		local x = math.round((left + right) / 2)
+		local panelTop = 16 + 200 * scale
+		if reshape then
+			holder.AnchorPoint = Vector2.new(0.5, 1)
+			holder.Size = UDim2.fromOffset(math.clamp((right - left) / scale, 320, 560), 200)
+		end
+		self.Spots[holder] = { UDim2.new(0, x, 1, -16), UDim2.new(0, x, 1, math.ceil(panelTop)) }
+		if besideFits then
+			self.Carousel.AnchorPoint = Vector2.new(1, 1)
+			self.Spots[self.Carousel] = { UDim2.new(1, -16, 1, -16), UDim2.new(1, -16, 1, carouselAway) }
+		else
+			-- too narrow for both: stacked above the panel
+			self.Carousel.AnchorPoint = Vector2.new(0.5, 1)
+			self.Spots[self.Carousel] = { UDim2.new(0, x, 1, -math.ceil(panelTop + 8)), UDim2.new(0, x, 1, carouselAway) }
+		end
+		hintX = UDim.new(0, x)
+		if self.CarouselShown and not besideFits then
+			hintBottom = panelTop + 8 + carouselHeight + 6
+		elseif self.PanelShown then
+			hintBottom = panelTop + 6
+		else
+			hintBottom = 16 + carouselHeight + 8
+		end
+	else
+		-- right edge, between the top bar and the hint over the carousel; tall
+		-- content grows the glass (up to 540) before the column has to scroll
+		local lowest = viewport.Y - (18 + carouselHeight + 8 + 18 * scale + 4)
+		local panelHeight = math.clamp(self.PanelNeed, 440, math.max(440, math.min(540, (lowest - top) / scale)))
+		local halfPanel = panelHeight * scale / 2
+		local y = math.round(math.clamp(viewport.Y * 0.55, top + halfPanel, math.max(lowest - halfPanel, top + halfPanel)))
+		if reshape then
+			holder.AnchorPoint = Vector2.new(1, 0.5)
+			holder.Size = UDim2.fromOffset(320, panelHeight)
+		end
+		self.Spots[holder] = { UDim2.new(1, -96, 0, y), UDim2.new(1, math.ceil(320 * scale) + 16, 0, y) }
+		self.Carousel.AnchorPoint = Vector2.new(0.5, 1)
+		self.Spots[self.Carousel] = { UDim2.new(0.5, 0, 1, -18), UDim2.new(0.5, 0, 1, carouselAway) }
+		hintX = UDim.new(0.5, 0)
+		hintBottom = 18 + carouselHeight + 8
+	end
+	self.Hint.Position = UDim2.new(hintX.Scale, hintX.Offset, 1, -math.ceil(hintBottom))
+
+	local shown = { [self.Nav] = self.NavShown, [self.BackHolder] = self.BackShown, [self.Carousel] = self.CarouselShown, [holder] = self.PanelShown }
+	for object, isShown in shown do
+		local spot = self.Spots[object]
+		if snap then
+			if isShown then
+				self:_place(object, spot[1])
+			elseif object.Visible then
+				-- still sliding out
+				self:_place(object, spot[2])
+			end
+		elseif object == holder and isShown and holder.Visible and not self.Hiding[holder] and holder.Position ~= spot[1] then
+			self:_place(holder, spot[1], Theme.Tween.Medium)
+		end
+	end
+	self:_navChanged()
+end
+
+-- Moves an edge element, replacing any move still running on it.
+function FactoryHud:_place(object: GuiObject, position: UDim2, info: TweenInfo?)
+	local running = self.Moves[object]
+	if running then
+		running:Cancel()
+		self.Moves[object] = nil
+	end
+	if info then
+		self.Moves[object] = UI.Tween(object, info, { Position = position })
+	else
+		object.Position = position
+	end
+end
+
+-- Shows (slides in from off-screen) or hides (slides out, then Visible = false
+-- and onHidden) an edge element. Instant while the gui is off or with Reduce
+-- Motion. fromAway: restart the entrance even if it is already visible.
+function FactoryHud:_slide(object: GuiObject, shown: boolean, animate: boolean, onHidden: (() -> ())?, fromAway: boolean?)
+	local spot = self.Spots[object]
+	local token = (self.SlideTokens[object] or 0) + 1
+	self.SlideTokens[object] = token
+	self.Hiding[object] = nil
+	local motion = animate and self.Gui.Enabled and not Effects.ReduceMotion()
+	if shown then
+		if motion and (fromAway or not object.Visible) then
+			self:_place(object, spot[2])
+		end
+		object.Visible = true
+		self:_place(object, spot[1], if motion then Theme.Tween.Open else nil)
+	elseif motion and object.Visible then
+		self.Hiding[object] = true
+		self:_place(object, spot[2], Theme.Tween.Close)
+		task.delay(Theme.Tween.Close.Time, function()
+			if self.SlideTokens[object] == token then
+				self.Hiding[object] = nil
+				object.Visible = false
+				if onHidden then
+					onHidden()
+				end
+			end
+		end)
+	else
+		self:_place(object, spot[1])
+		object.Visible = false
+		if onHidden then
+			onHidden()
+		end
+	end
+end
+
+-- Tells the HUD where free space starts right of the nav, so it can move its
+-- left column (currencies, feed) out from under it.
+function FactoryHud:_navChanged()
+	local callback = self.Deps and self.Deps.OnNavChanged
+	local shown = self.Visible and self.NavShown
+	if callback and (shown ~= self.ReportedShown or self.NavInset ~= self.ReportedInset) then
+		self.ReportedShown = shown
+		self.ReportedInset = self.NavInset
+		callback(shown, self.NavInset)
+	end
+end
+
+-- Public API -------------------------------------------------------------------------------
 
 function FactoryHud:SetVisible(visible: boolean)
 	self.Visible = visible
 	self.Gui.Enabled = visible
-	if visible then
-		self.Nav.Position = UDim2.new(0, -80, 0.5, 20)
-		UI.Tween(self.Nav, Theme.Tween.Open, { Position = UDim2.new(0, 14, 0.5, 20) })
+	if visible and self.NavShown then
+		-- (a running show disables the gui again right away; SetCinematic(false)
+		-- replays the entrance)
+		self:_slide(self.Nav, true, true, nil, true)
 	end
+	self:_navChanged()
 end
 
 function FactoryHud:SetNavVisible(visible: boolean)
-	self.Nav.Visible = visible
+	self.NavShown = visible
+	self:_slide(self.Nav, visible, true)
+	self:_navChanged()
 end
 
 function FactoryHud:HighlightZone(zoneId: string?)
@@ -230,22 +487,28 @@ end
 
 function FactoryHud:ShowBack(onBack: () -> ())
 	self.OnBack = onBack
-	self.BackHolder.Visible = true
-	UI.Pop(self.BackButton.Instance, 0.15)
+	if self.BackShown then
+		-- switching modes: already on screen
+		UI.Pop(self.BackButton.Instance, 0.15)
+	else
+		self.BackShown = true
+		self:_slide(self.BackHolder, true, true)
+	end
 end
 
+-- (OnBack is cleared at once, so the sliding button no longer reacts)
 function FactoryHud:HideBack()
 	self.OnBack = nil
-	self.BackHolder.Visible = false
+	self.BackShown = false
+	self:_slide(self.BackHolder, false, true)
 end
 
 function FactoryHud:ShowCarousel(onPrev: () -> (), onNext: () -> ())
 	self.OnPrev = onPrev
 	self.OnNext = onNext
-	self.Carousel.Visible = true
-	local compact = UI.IsCompact()
-	self.Carousel.Position = if compact then UDim2.new(0.5, 0, 0, 70) else UDim2.new(0.5, 0, 1, -18)
-	self.Carousel.AnchorPoint = if compact then Vector2.new(0.5, 0) else Vector2.new(0.5, 1)
+	self.CarouselShown = true
+	self:_layout()
+	self:_slide(self.Carousel, true, true)
 end
 
 function FactoryHud:SetCarouselLabel(text: string)
@@ -256,12 +519,15 @@ end
 function FactoryHud:HideCarousel()
 	self.OnPrev = nil
 	self.OnNext = nil
-	self.Carousel.Visible = false
+	self.CarouselShown = false
+	self:_slide(self.Carousel, false, true)
+	self:_layout()
 end
 
 function FactoryHud:SetHint(text: string?)
 	if not text then
 		self.Hint.Text = ""
+		self.Hint.Visible = false
 		return
 	end
 	if UserInputService.GamepadEnabled then
@@ -269,9 +535,25 @@ function FactoryHud:SetHint(text: string?)
 	elseif UserInputService.KeyboardEnabled then
 		text = text:gsub("%[Keys%]", "← →"):gsub("%[Confirm%]", "Enter"):gsub("%[Alt%]", "T"):gsub("%[Back%]", "Backspace")
 	else
-		text = text:gsub("%[Keys%]", "Swipe"):gsub("%[Confirm%]", "Tap"):gsub("%[Alt%]", "Tap"):gsub("%[Back%]", "Back")
+		-- Touch: ◀ ▶ and Back are on-screen buttons and there is nothing to swipe
+		-- (zones that handle swipes word their own hint). The Back button labels
+		-- itself, so "[Back] Back" segments are dropped.
+		local parts = {}
+		for _, part in string.split(text, "·") do
+			local segment = string.match(part, "^%s*(.-)%s*$") or ""
+			local back = string.match(segment, "^%[Back%]%s*(.*)$")
+			if back then
+				if back ~= "" and back ~= "Back" and back ~= "Exit" then
+					table.insert(parts, "Tap ← Back to " .. string.lower(back))
+				end
+			elseif segment ~= "" then
+				table.insert(parts, (segment:gsub("%[Keys%]", "◀ ▶"):gsub("%[Confirm%]", "Tap"):gsub("%[Alt%]", "Tap")))
+			end
+		end
+		text = table.concat(parts, "  ·  ")
 	end
 	self.Hint.Text = text
+	self.Hint.Visible = text ~= ""
 end
 
 -- Context panel --------------------------------------------------------------------------
@@ -280,20 +562,29 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 	self.PanelTrove:Clean()
 	local holder = self.PanelHolder
 	local compact = UI.IsCompact()
-	holder.Visible = true
-	if compact then
-		holder.AnchorPoint = Vector2.new(0.5, 1)
-		holder.Position = UDim2.new(0.5, 0, 1, -12)
-		holder.Size = UDim2.fromOffset(560, 200)
-	else
-		holder.AnchorPoint = Vector2.new(1, 0.5)
-		holder.Position = UDim2.new(1, -96, 0.55, 0)
-		holder.Size = UDim2.fromOffset(320, 440)
+	-- The price/button stack is sized up front: the text column stops above it
+	-- (phones: three buttons get shorter so the stack fits the 200 px glass)
+	local buttonCount = if spec.Buttons then #spec.Buttons else 0
+	local buttonHeight = if not compact then 52 elseif buttonCount >= 3 then 38 else 46
+	local stack = buttonCount + (if spec.Price then 1 else 0)
+	local actionsHeight = (if spec.Price then 30 else 0) + buttonCount * buttonHeight + math.max(stack - 1, 0) * 8
+	self.PanelNeed = 16 + columnHeight(spec, 320 - 36) + 10 + actionsHeight + 16
+	self.PanelShown = true
+	-- (replacing a panel that is still sliding out: it is gone already, the new
+	-- one appears in place)
+	local appearing = not holder.Visible or self.Hiding[holder]
+	self.Hiding[holder] = nil
+	self:_layout()
+	if appearing then
+		self:_slide(holder, true, false)
 	end
 
 	local rarity = Rarities.Get(spec.Rarity)
+	-- (centred so the pop below scales in place)
 	local panel = UI.Glass({
 		Name = "Panel",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 0.22,
 		StrokeColor = if spec.Rarity then rarity.Color else nil,
@@ -305,11 +596,20 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 	scale.Scale = 0.9
 	UI.Tween(scale, Theme.Tween.Spring, { Scale = 1 })
 
-	local column = UI.new("Frame", {
+	-- Scrolls when the text is taller than the room left by the actions
+	local column = UI.new("ScrollingFrame", {
 		Name = "Column",
 		Position = UDim2.fromOffset(18, 16),
-		Size = if compact then UDim2.new(0.58, -18, 1, -32) else UDim2.new(1, -36, 1, -32),
+		Size = if compact then UDim2.new(0.58, -26, 1, -32) else UDim2.new(1, -36, 1, -(42 + actionsHeight)),
 		BackgroundTransparency = 1,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Theme.Colors.SubText,
+		ScrollBarImageTransparency = 0.4,
+		VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar,
+		Selectable = false,
 		Parent = panel,
 	}, { UI.List(Enum.FillDirection.Vertical, 6) })
 
@@ -357,7 +657,19 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 	end
 
 	if spec.Status then
-		UI.Label({ Text = spec.Status, Size = UDim2.new(1, 0, 0, 20), TextSize = 15, TextColor3 = Theme.Colors.Warning, LayoutOrder = 60, TextWrapped = true, Parent = column })
+		-- (wraps instead of cutting off long lock requirements)
+		UI.Label({
+			Text = spec.Status,
+			Size = UDim2.new(1, 0, 0, 20),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			TextSize = 15,
+			TextColor3 = Theme.Colors.Warning,
+			LayoutOrder = 60,
+			TextWrapped = true,
+			TextTruncate = Enum.TextTruncate.None,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			Parent = column,
+		})
 	end
 
 	-- Price + buttons
@@ -371,48 +683,61 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 		Parent = panel,
 	}, { UI.List(Enum.FillDirection.Vertical, 8, Enum.HorizontalAlignment.Center, Enum.VerticalAlignment.Bottom) })
 
-	if spec.Price then
-		local currency = Currencies.Get(spec.Price.Currency)
+	local price = spec.Price
+	if price then
+		local currencyId = price.Currency
+		local currency = Currencies.Get(currencyId)
+		-- whole amounts only, also mid count-up (no "🪙 212.4")
+		local function priceText(amount: number): string
+			amount = math.round(amount)
+			return if currencyId == "Robux" then "R$ " .. Format.Commas(amount) else string.format("%s %s", if currency then currency.Glyph else "", Format.Abbreviate(amount))
+		end
 		local priceLabel = UI.Label({
-			Text = if spec.Price.Currency == "Robux" then "R$ " .. Format.Commas(spec.Price.Amount) else string.format("%s %s", if currency then currency.Glyph else "", Format.Abbreviate(spec.Price.Amount)),
+			Text = priceText(price.Amount),
 			Size = UDim2.new(1, 0, 0, 30),
 			TextXAlignment = Enum.TextXAlignment.Center,
 			FontFace = Theme.Fonts.Numbers,
 			TextSize = 26,
-			TextColor3 = if spec.Price.Affordable then Theme.Colors.Gold else Theme.Colors.Danger,
+			TextColor3 = if price.Affordable then Theme.Colors.Gold else Theme.Colors.Danger,
 			LayoutOrder = 1,
 			Parent = actions,
 		})
-		UI.CountTo(priceLabel, 0, spec.Price.Amount, 0.5, function(v)
-			return if spec.Price.Currency == "Robux" then "R$ " .. Format.Commas(v) else string.format("%s %s", if currency then currency.Glyph else "", Format.Abbreviate(v))
-		end)
+		UI.CountTo(priceLabel, 0, price.Amount, 0.5, priceText)
 	end
 
 	table.clear(self.Buttons)
 	if spec.Buttons then
+		local first: TextButton? = nil
+		local firstEnabled: TextButton? = nil
 		for i, b in spec.Buttons do
+			-- The list stacks slots; each button is centred in its slot so hover
+			-- and press scale it in place.
+			local slot = UI.new("Frame", { Name = b.Id or ("Action" .. i), Size = UDim2.new(1, 0, 0, buttonHeight), BackgroundTransparency = 1, LayoutOrder = 10 + i, Parent = actions })
 			local button = UI.Button({
 				Name = b.Id or ("Action" .. i),
 				Text = b.Text,
 				Glyph = b.Glyph,
 				Style = b.Style or "Primary",
 				Enabled = b.Enabled ~= false,
-				Size = UDim2.new(1, 0, 0, if compact then 46 else 52),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromScale(1, 1),
 				TextSize = 19,
-				LayoutOrder = 10 + i,
-				Parent = actions,
+				Parent = slot,
 				OnClick = b.OnClick,
 			})
 			self.PanelTrove:Add(button)
 			if b.Id then
 				self.Buttons[b.Id] = button
 			end
-		end
-		if UserInputService.GamepadEnabled then
-			local first = actions:FindFirstChildWhichIsA("TextButton")
-			if first then
-				GuiService.SelectedObject = first
+			first = first or button.Instance
+			if b.Enabled ~= false and not firstEnabled then
+				firstEnabled = button.Instance
 			end
+		end
+		local selected = firstEnabled or first
+		if UserInputService.GamepadEnabled and selected then
+			GuiService.SelectedObject = selected
 		end
 	end
 	Audio.Play("Tick")
@@ -423,14 +748,35 @@ function FactoryHud:GetButton(id: string)
 end
 
 function FactoryHud:HidePanel()
-	self.PanelTrove:Clean()
-	self.PanelHolder.Visible = false
 	table.clear(self.Buttons)
+	self.PanelShown = false
+	-- The leaving panel's buttons stop reacting at once; the glass slides away
+	-- and is destroyed after (or right away when a new panel replaces it).
+	for _, object in self.PanelHolder:GetDescendants() do
+		if object:IsA("GuiButton") then
+			object.Interactable = false
+		end
+	end
+	self:_slide(self.PanelHolder, false, true, function()
+		self.PanelTrove:Clean()
+	end)
+	self:_layout()
 end
 
--- Hides everything except the skip button during shows.
+-- Hides everything except the skip button during shows. When the gui comes
+-- back (also after the entry show, which began before the player was inside)
+-- the edge elements slide in again.
 function FactoryHud:SetCinematic(enabled: boolean)
+	local was = self.Gui.Enabled
 	self.Gui.Enabled = self.Visible and not enabled
+	if self.Gui.Enabled and not was then
+		local shown = { [self.Nav] = self.NavShown, [self.BackHolder] = self.BackShown, [self.Carousel] = self.CarouselShown, [self.PanelHolder] = self.PanelShown }
+		for object, isShown in shown do
+			if isShown then
+				self:_slide(object, true, true, nil, true)
+			end
+		end
+	end
 end
 
 return FactoryHud
