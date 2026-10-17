@@ -87,7 +87,13 @@ function FactoryHud.new(deps)
 	self.CarouselShown = false
 	self.PanelShown = false
 	self.PanelNeed = 440
+	-- the shown panel's spec and layout, to rebuild it when the layout flips
+	self.PanelSpec = nil :: PanelSpec?
+	self.PanelCompact = false
 	self.NavInset = 0
+	self.Cinematic = false
+	self.CinematicToken = 0
+	self.HintFade = nil :: Tween?
 
 	local gui = UI.new("ScreenGui", {
 		Name = "FactoryHud",
@@ -299,6 +305,17 @@ function FactoryHud:_layout(snap: boolean?)
 	local compact = UI.IsCompact()
 	local top = GuiService:GetGuiInset().Y + 8
 
+	-- A panel built for the other layout (window resized across the phone
+	-- threshold) is rebuilt for this one
+	local spec = self.PanelSpec
+	if snap and spec and self.PanelShown and self.PanelCompact ~= compact then
+		task.defer(function()
+			if self.PanelShown and self.PanelSpec == spec and self.PanelCompact ~= UI.IsCompact() then
+				self:ShowPanel(spec)
+			end
+		end)
+	end
+
 	-- Nav: as many rows as fit at the auto scale, balanced over the columns
 	local bottom = viewport.Y - (16 + 54 * scale + 10)
 	local room = math.max(bottom - top, 1)
@@ -333,7 +350,8 @@ function FactoryHud:_layout(snap: boolean?)
 	local hintX: UDim
 	local hintBottom: number
 	if compact then
-		local left = 16 + 140 * scale + 12
+		-- (right of the Back button, and of the nav where it is the wider one)
+		local left = math.max(16 + 140 * scale, 14 + navWidth) + 12
 		local beside = viewport.X - (16 + 300 * scale + 12)
 		local besideFits = beside - left >= 320 * scale
 		local right = if self.CarouselShown and besideFits then beside else viewport.X - left
@@ -379,21 +397,26 @@ function FactoryHud:_layout(snap: boolean?)
 	end
 	self.Hint.Position = UDim2.new(hintX.Scale, hintX.Offset, 1, -math.ceil(hintBottom))
 
-	local shown = { [self.Nav] = self.NavShown, [self.BackHolder] = self.BackShown, [self.Carousel] = self.CarouselShown, [holder] = self.PanelShown }
-	for object, isShown in shown do
+	for object, isShown in self:_edges() do
 		local spot = self.Spots[object]
 		if snap then
 			if isShown then
-				self:_place(object, spot[1])
+				-- (during a show they wait off-screen)
+				self:_place(object, if self.Cinematic then spot[2] else spot[1])
 			elseif object.Visible then
 				-- still sliding out
 				self:_place(object, spot[2])
 			end
-		elseif object == holder and isShown and holder.Visible and not self.Hiding[holder] and holder.Position ~= spot[1] then
+		elseif object == holder and isShown and holder.Visible and not self.Hiding[holder] and not self.Cinematic and holder.Position ~= spot[1] then
 			self:_place(holder, spot[1], Theme.Tween.Medium)
 		end
 	end
 	self:_navChanged()
+end
+
+-- The edge elements and whether each one belongs on screen.
+function FactoryHud:_edges(): { [GuiObject]: boolean }
+	return { [self.Nav] = self.NavShown, [self.BackHolder] = self.BackShown, [self.Carousel] = self.CarouselShown, [self.PanelHolder] = self.PanelShown }
 end
 
 -- Moves an edge element, replacing any move still running on it.
@@ -419,7 +442,11 @@ function FactoryHud:_slide(object: GuiObject, shown: boolean, animate: boolean, 
 	self.SlideTokens[object] = token
 	self.Hiding[object] = nil
 	local motion = animate and self.Gui.Enabled and not Effects.ReduceMotion()
-	if shown then
+	if shown and self.Cinematic then
+		-- during a show it waits off-screen; SetCinematic(false) brings it in
+		self:_place(object, spot[2], if motion and object.Visible then Theme.Tween.Close else nil)
+		object.Visible = true
+	elseif shown then
 		if motion and (fromAway or not object.Visible) then
 			self:_place(object, spot[2])
 		end
@@ -462,10 +489,9 @@ end
 
 function FactoryHud:SetVisible(visible: boolean)
 	self.Visible = visible
-	self.Gui.Enabled = visible
-	if visible and self.NavShown then
-		-- (a running show disables the gui again right away; SetCinematic(false)
-		-- replays the entrance)
+	-- (stays off while a show runs; SetCinematic(false) plays the entrance then)
+	self.Gui.Enabled = visible and not self.Cinematic
+	if self.Gui.Enabled and self.NavShown then
 		self:_slide(self.Nav, true, true, nil, true)
 	end
 	self:_navChanged()
@@ -570,6 +596,8 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 	local actionsHeight = (if spec.Price then 30 else 0) + buttonCount * buttonHeight + math.max(stack - 1, 0) * 8
 	self.PanelNeed = 16 + columnHeight(spec, 320 - 36) + 10 + actionsHeight + 16
 	self.PanelShown = true
+	self.PanelSpec = spec
+	self.PanelCompact = compact
 	-- (replacing a panel that is still sliding out: it is gone already, the new
 	-- one appears in place)
 	local appearing = not holder.Visible or self.Hiding[holder]
@@ -750,6 +778,7 @@ end
 function FactoryHud:HidePanel()
 	table.clear(self.Buttons)
 	self.PanelShown = false
+	self.PanelSpec = nil
 	-- The leaving panel's buttons stop reacting at once; the glass slides away
 	-- and is destroyed after (or right away when a new panel replaces it).
 	for _, object in self.PanelHolder:GetDescendants() do
@@ -763,20 +792,59 @@ function FactoryHud:HidePanel()
 	self:_layout()
 end
 
--- Hides everything except the skip button during shows. When the gui comes
+-- Fades the hint out for shows and back in after them.
+function FactoryHud:_fadeHint(shown: boolean, info: TweenInfo?)
+	if self.HintFade then
+		self.HintFade:Cancel()
+		self.HintFade = nil
+	end
+	local goal = { TextTransparency = if shown then 0 else 1, TextStrokeTransparency = if shown then 0.6 else 1 }
+	if info then
+		self.HintFade = UI.Tween(self.Hint, info, goal)
+	else
+		self.Hint.TextTransparency = goal.TextTransparency
+		self.Hint.TextStrokeTransparency = goal.TextStrokeTransparency
+	end
+end
+
+-- Hides everything except the skip button during shows: the edge elements
+-- slide away and the hint fades before the gui switches off. When it comes
 -- back (also after the entry show, which began before the player was inside)
 -- the edge elements slide in again.
 function FactoryHud:SetCinematic(enabled: boolean)
+	self.Cinematic = enabled
+	self.CinematicToken += 1
+	local token = self.CinematicToken
 	local was = self.Gui.Enabled
-	self.Gui.Enabled = self.Visible and not enabled
-	if self.Gui.Enabled and not was then
-		local shown = { [self.Nav] = self.NavShown, [self.BackHolder] = self.BackShown, [self.Carousel] = self.CarouselShown, [self.PanelHolder] = self.PanelShown }
-		for object, isShown in shown do
+	if enabled then
+		if was and not Effects.ReduceMotion() then
+			for object, isShown in self:_edges() do
+				if isShown and object.Visible then
+					self:_place(object, self.Spots[object][2], Theme.Tween.Close)
+				end
+			end
+			self:_fadeHint(false, Theme.Tween.Close)
+			task.delay(Theme.Tween.Close.Time, function()
+				if self.CinematicToken == token then
+					self.Gui.Enabled = false
+				end
+			end)
+		else
+			self.Gui.Enabled = false
+			self:_fadeHint(false)
+		end
+		return
+	end
+	self.Gui.Enabled = self.Visible
+	if self.Gui.Enabled then
+		-- (back from where the show sent them; from off-screen if the gui was off)
+		for object, isShown in self:_edges() do
 			if isShown then
-				self:_slide(object, true, true, nil, true)
+				self:_slide(object, true, true, nil, not was)
 			end
 		end
 	end
+	self:_fadeHint(true, if self.Gui.Enabled then Theme.Tween.Medium else nil)
 end
 
 return FactoryHud
