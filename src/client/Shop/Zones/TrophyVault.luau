@@ -30,6 +30,9 @@ local TrophyVault = {}
 TrophyVault.__index = TrophyVault
 
 local HOLO = Color3.fromRGB(90, 200, 255)
+-- How far the vault door swings open: into the vault, so the corridor, the
+-- console and whoever opened it stay clear of the steel.
+local DOOR_OPEN = math.rad(88)
 
 function TrophyVault.new(view)
 	local self = setmetatable({}, TrophyVault)
@@ -41,6 +44,8 @@ function TrophyVault.new(view)
 	self.DoorOpen = false
 	self.DoorAngle = 0
 	self.Focused = nil :: string?
+	-- trophies being claimed: their unlock waits for the cores to land (see _buy)
+	self.Claiming = {} :: { [string]: boolean }
 
 	local folder = view:Find("TrophyVault/Pedestals")
 	if folder then
@@ -130,7 +135,9 @@ function TrophyVault:_buildDoor()
 	self.ActiveTrove:Add(model)
 	self.Door = model
 	self.DoorParts = {}
-	local hinge = base * CFrame.new(-radius, 0, 0)
+	-- hinge on the left edge of the disc's vault-side face: swinging inwards, the
+	-- door clears the frame ring and folds back along the vault wall
+	local hinge = base * CFrame.new(-radius, 0, 0.8)
 	self.Hinge = hinge
 	for _, p in model:GetChildren() do
 		if p:IsA("BasePart") then
@@ -148,8 +155,8 @@ function TrophyVault:_poseDoor(angle: number, wheel: number, boltOut: number)
 		return
 	end
 	local hinge = self.Hinge :: CFrame
-	-- positive angle swings the door out into the corridor, away from the wall
-	local swung = hinge * CFrame.Angles(0, angle, 0)
+	-- positive angle swings the door into the vault, away from the corridor
+	local swung = hinge * CFrame.Angles(0, -angle, 0)
 	local parts, frames = {}, {}
 	local base = self.Anchor and self.Anchor.CFrame or hinge
 	for _, entry in self.DoorParts do
@@ -166,7 +173,8 @@ function TrophyVault:_poseDoor(angle: number, wheel: number, boltOut: number)
 	workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
 	local disc = self.Door:FindFirstChild("Disc") :: BasePart?
 	if disc then
-		disc.CanCollide = angle < 0.5
+		-- solid while shut, never a moving collider that shoves a player
+		disc.CanCollide = math.abs(angle) < 0.05
 	end
 end
 
@@ -181,7 +189,7 @@ function TrophyVault:TryOpen()
 		local start = os.clock()
 		self.DoorBusy = true
 		local connection
-		connection = RunService.Heartbeat:Connect(function()
+		connection = self.ActiveTrove:Connect(RunService.Heartbeat, function()
 			local t = os.clock() - start
 			self:_poseDoor(math.sin(t * 40) * 0.01, math.sin(t * 30) * 0.15, 0)
 			if t > 0.5 then
@@ -195,31 +203,64 @@ function TrophyVault:TryOpen()
 	self.DoorBusy = true
 	Audio.PlayAt("Clank", self.Anchor.Position)
 	local start = os.clock()
+	local revealed = false
 	local connection
-	connection = RunService.Heartbeat:Connect(function()
+	connection = self.ActiveTrove:Connect(RunService.Heartbeat, function()
 		local t = os.clock() - start
 		local wheel = math.min(t / 1.0, 1) * math.pi * 2
 		local bolts = math.clamp((t - 0.6) / 0.4, 0, 1)
-		local swing = TweenService:GetValue(math.clamp((t - 1.0) / 1.6, 0, 1), Enum.EasingStyle.Quint, Enum.EasingDirection.InOut) * math.rad(105)
+		local swing = TweenService:GetValue(math.clamp((t - 1.0) / 1.6, 0, 1), Enum.EasingStyle.Quint, Enum.EasingDirection.InOut) * DOOR_OPEN
 		self:_poseDoor(swing, wheel, bolts)
+		-- the vault lights up once the door is open far enough to see inside
+		if not revealed and swing >= DOOR_OPEN * 0.4 then
+			revealed = true
+			self:_reveal()
+		end
 		if t > 2.7 then
 			connection:Disconnect()
 			self.DoorOpen = true
 			self.DoorBusy = false
 			self.OpenedAt = os.clock()
+			self:_settleDoor()
 		end
 	end)
-	task.delay(1.0, function()
-		if self.Anchor then
-			local inside = self.Anchor.Position + self.Anchor.CFrame.LookVector * -4
-			Effects.GlowBall(inside, Color3.fromRGB(255, 210, 120), 18, 1)
-			Effects.FlashLight(inside, Color3.fromRGB(255, 220, 150), 6, 40, 2.5)
-			Effects.Burst(inside, "Glitter", 40, Color3.fromRGB(255, 210, 120))
-			local fan = Effects.LightFan(inside, { Color3.fromRGB(255, 214, 120), Color3.fromRGB(255, 245, 210) }, 12, 16)
-			task.delay(2.6, fan.Stop)
-			Audio.PlayAt("Fanfare", self.Anchor.Position)
-		end
-	end)
+end
+
+-- Open and at rest, the door is solid again (nobody walks through the steel),
+-- unless the local player stands right where it stopped.
+function TrophyVault:_settleDoor()
+	local disc = if self.Door then self.Door:FindFirstChild("Disc") :: BasePart? else nil
+	if not disc then
+		return
+	end
+	local root = self.View.Controller:GetRoot()
+	local clear = true
+	if root then
+		-- (a cylinder's axis is its X: across the slab; the disc lies in its YZ plane)
+		local p = disc.CFrame:PointToObjectSpace(root.Position)
+		clear = math.abs(p.X) > disc.Size.X / 2 + 3 or Vector2.new(p.Y, p.Z).Magnitude > disc.Size.Y / 2 + 3
+	end
+	disc.CanCollide = clear
+end
+
+-- Golden light floods out of the opening vault. The glow and the light fan sit
+-- deep inside, beyond the door's sweep (19 studs around the hinge), so the
+-- swinging steel never cuts through them; the opening uncovers them.
+function TrophyVault:_reveal()
+	local anchor = self.Anchor
+	if not anchor then
+		return
+	end
+	local inward = -anchor.CFrame.LookVector
+	local doorway = anchor.Position + inward * 2
+	local deep = anchor.Position + inward * 26
+	Effects.FlashLight(doorway, Color3.fromRGB(255, 220, 150), 6, 40, 2.5)
+	Effects.Burst(doorway, "Glitter", 40, Color3.fromRGB(255, 210, 120))
+	Effects.GlowBall(deep, Color3.fromRGB(255, 210, 120), 14, 1)
+	local fan = Effects.LightFan(deep, { Color3.fromRGB(255, 214, 120), Color3.fromRGB(255, 245, 210) }, 12, 16)
+	self.ActiveTrove:Add(fan.Stop)
+	task.delay(2.6, fan.Stop)
+	Audio.PlayAt("Fanfare", anchor.Position)
 end
 
 function TrophyVault:_close()
@@ -229,9 +270,9 @@ function TrophyVault:_close()
 	self.DoorBusy = true
 	local start = os.clock()
 	local connection
-	connection = RunService.Heartbeat:Connect(function()
+	connection = self.ActiveTrove:Connect(RunService.Heartbeat, function()
 		local t = os.clock() - start
-		local swing = (1 - TweenService:GetValue(math.clamp(t / 1.4, 0, 1), Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)) * math.rad(105)
+		local swing = (1 - TweenService:GetValue(math.clamp(t / 1.4, 0, 1), Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)) * DOOR_OPEN
 		self:_poseDoor(swing, 0, if t > 1.4 then 0 else 1)
 		if t > 1.5 then
 			connection:Disconnect()
@@ -260,7 +301,8 @@ local function holoize(model: Model)
 	end
 end
 
-local function materialize(model: Model)
+-- Hologram to solid, part by part from the bottom up. Returns how long it takes.
+local function materialize(model: Model): number
 	local parts = {}
 	for _, p in model:GetDescendants() do
 		if p:IsA("BasePart") and p:GetAttribute("OrigColor") then
@@ -276,9 +318,44 @@ local function materialize(model: Model)
 				return
 			end
 			p.Material = Enum.Material[p:GetAttribute("OrigMaterial")] or Enum.Material.SmoothPlastic
-			TweenService:Create(p, TweenInfo.new(0.35), { Color = p:GetAttribute("OrigColor"), Transparency = p:GetAttribute("OrigTransparency") or 0 }):Play()
+			local tween = TweenService:Create(p, TweenInfo.new(0.35), { Color = p:GetAttribute("OrigColor"), Transparency = p:GetAttribute("OrigTransparency") or 0 })
+			-- solid now: the glow pulse may drive its transparency again
+			tween.Completed:Connect(function()
+				p:SetAttribute("OrigColor", nil)
+				p:SetAttribute("OrigMaterial", nil)
+				p:SetAttribute("OrigTransparency", nil)
+			end)
+			tween:Play()
 		end)
 	end
+	return #parts * 0.05 + 0.35
+end
+
+-- Places a trophy for time t (turntable spin, bob, wing flap, jaw, glow pulse)
+-- and appends its parts to the BulkMoveTo lists.
+local function poseTrophy(entry, t: number, parts: { BasePart }, frames: { CFrame })
+	local root = entry.Top.CFrame * CFrame.Angles(0, t * entry.Spin, 0)
+	for _, p in entry.Parts do
+		local part = p.Part
+		local cf = root * p.Home
+		if p.Bob then
+			cf = cf + Vector3.new(0, math.sin(t * 2.2) * p.Bob, 0)
+		end
+		if p.Wing and p.Hinge then
+			cf = root * p.Hinge * CFrame.Angles(0, 0, p.Wing * math.sin(t * 7) * 0.45) * p.HingeInverse * p.Home
+		elseif p.Jaw and p.Hinge then
+			local open = if entry.Breathing then 0.35 else 0.05 + math.max(math.sin(t * 2), 0) * 0.08
+			cf = root * p.Hinge * CFrame.Angles(open, 0, 0) * p.HingeInverse * p.Home
+		end
+		-- (not while it still materializes: the sweep tweens its transparency)
+		if p.Pulse and entry.Owned and part:GetAttribute("OrigColor") == nil then
+			part.Transparency = 0.1 + 0.2 * (0.5 + 0.5 * math.sin(t * 4))
+		end
+		table.insert(parts, part)
+		table.insert(frames, cf)
+	end
+	table.insert(parts, entry.Model.PrimaryPart)
+	table.insert(frames, root)
 end
 
 function TrophyVault:_buildPedestal(entry, owned: boolean)
@@ -286,61 +363,109 @@ function TrophyVault:_buildPedestal(entry, owned: boolean)
 		entry.Model:Destroy()
 	end
 	local model = TrophyModel.Build(entry.Trophy.Model)
-	model.Parent = self.View.LocalFolder
+	local root = model.PrimaryPart :: BasePart
 	entry.Model = model
 	if not owned then
 		holoize(model)
 	end
 	entry.Parts = {}
 	for _, p in model:GetDescendants() do
-		if p:IsA("BasePart") and p ~= model.PrimaryPart then
-			table.insert(entry.Parts, { Part = p, Home = p:GetAttribute("Home") or CFrame.identity })
+		if p:IsA("BasePart") then
+			-- (an imported asset may come unanchored: the turntable moves every part)
+			p.Anchored = true
+			if p ~= root then
+				local home = p:GetAttribute("Home")
+				local hinge = p:GetAttribute("Hinge")
+				local hingeCf = if typeof(hinge) == "Vector3" then CFrame.new(hinge) else nil
+				table.insert(entry.Parts, {
+					Part = p,
+					-- an imported asset has no Home attributes: keep its own layout around the root
+					Home = if typeof(home) == "CFrame" then home else root.CFrame:ToObjectSpace(p.CFrame),
+					Bob = p:GetAttribute("Bob"),
+					Wing = p:GetAttribute("Wing"),
+					Jaw = p:GetAttribute("Jaw"),
+					Pulse = p:GetAttribute("Pulse"),
+					Hinge = hingeCf,
+					HingeInverse = if hingeCf then hingeCf:Inverse() else nil,
+				})
+			end
 		end
 	end
+	entry.Spin = model:GetAttribute("SpinAll") or 0.25
 	entry.Mouth = model:FindFirstChild("Mouth", true)
 	entry.NextBreath = os.clock() + math.random() * 3
-	self.ActiveTrove:Add(model)
-
-	-- plate text
-	local plate = entry.Plate
-	if plate then
-		local existing = plate:FindFirstChild("TrophyPlate")
-		if existing then
-			existing:Destroy()
-		end
-		local face = Enum.NormalId[plate:GetAttribute("Face") or "Right"] or Enum.NormalId.Right
-		local gui = UI.new("SurfaceGui", { Name = "TrophyPlate", Face = face, SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud, PixelsPerStud = 40, LightInfluence = 0, Brightness = 1.6, Parent = plate })
-		local rarity = Rarities.Get(entry.Trophy.Rarity)
-		local currency = Currencies.Get(entry.Trophy.Currency)
-		UI.Label({ Text = entry.Trophy.Name, Size = UDim2.fromScale(1, 0.5), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Center, FontFace = Theme.Fonts.Title, TextColor3 = rarity.Color, Parent = gui })
-		UI.Label({
-			Text = if owned then "✔ IN YOUR COLLECTION" else string.format("%s %d %s", currency and currency.Glyph or "", entry.Trophy.Price, currency and currency.Short or ""),
-			Position = UDim2.fromScale(0, 0.5),
-			Size = UDim2.fromScale(1, 0.45),
-			TextScaled = true,
-			TextXAlignment = Enum.TextXAlignment.Center,
-			TextColor3 = if owned then Theme.Colors.Success else Theme.Colors.Gold,
-			Parent = gui,
-		})
-		self.ActiveTrove:Add(gui)
+	model.Parent = self.View.LocalFolder
+	-- posed in the same frame: it was built around the world origin
+	if entry.Top then
+		local parts, frames = {}, {}
+		poseTrophy(entry, os.clock(), parts, frames)
+		workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
 	end
+	self.ActiveTrove:Add(model)
+	self:_buildPlate(entry, owned)
+end
+
+-- Name and price (or "in your collection") on the pedestal's front plate.
+function TrophyVault:_buildPlate(entry, owned: boolean)
+	local plate = entry.Plate
+	if not plate then
+		return
+	end
+	local existing = plate:FindFirstChild("TrophyPlate")
+	if existing then
+		existing:Destroy()
+	end
+	local face = Enum.NormalId[plate:GetAttribute("Face") or "Right"] or Enum.NormalId.Right
+	-- (sharp up close: the focus shot and players walking up see it from a few studs)
+	local gui = UI.new("SurfaceGui", { Name = "TrophyPlate", Face = face, SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud, PixelsPerStud = 120, LightInfluence = 0, Brightness = 1.6, Parent = plate })
+	local rarity = Rarities.Get(entry.Trophy.Rarity)
+	local currency = Currencies.Get(entry.Trophy.Currency)
+	UI.Label({ Text = entry.Trophy.Name, Position = UDim2.fromScale(0.05, 0.08), Size = UDim2.fromScale(0.9, 0.44), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Center, FontFace = Theme.Fonts.Title, TextColor3 = rarity.Color, Parent = gui })
+	UI.Label({
+		Text = if owned then "✔ IN YOUR COLLECTION" else string.format("%s %d %s", currency and currency.Glyph or "", entry.Trophy.Price, currency and currency.Short or ""),
+		Position = UDim2.fromScale(0.05, 0.56),
+		Size = UDim2.fromScale(0.9, 0.34),
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextColor3 = if owned then Theme.Colors.Success else Theme.Colors.Gold,
+		Parent = gui,
+	})
+	self.ActiveTrove:Add(gui)
+end
+
+-- The hologram turns solid in place: sparks and confetti, the plate updates
+-- once the sweep is done, the first fire breath comes from the finished trophy.
+function TrophyVault:_unlock(entry)
+	local model = entry.Model
+	local burst = entry.Top.Position + Vector3.new(0, 2, 0)
+	local duration = materialize(model)
+	Effects.Burst(burst, "Sparks", 40, Rarities.Get(entry.Trophy.Rarity).Color)
+	Effects.Confetti(burst, 80)
+	entry.NextBreath = os.clock() + duration + 0.6
+	task.delay(duration, function()
+		if entry.Model == model then
+			self:_buildPlate(entry, true)
+		end
+	end)
 end
 
 function TrophyVault:_refresh(animate: boolean)
 	local data = self.View.Controller.ClientData:Get()
+	if not data then
+		-- (nothing to show before the profile arrives: holograms now would replay
+		-- the unlock for every owned trophy once it does)
+		return
+	end
 	for id, entry in self.Pedestals do
-		local owned = data ~= nil and data.Trophies[id] == true
+		local owned = data.Trophies[id] == true
 		if entry.Owned ~= owned then
 			local wasHolo = entry.Owned == false
+			if wasHolo and owned and self.Claiming[id] then
+				-- _buy unlocks it once its cores have landed
+				continue
+			end
 			if animate and wasHolo and owned and entry.Model then
-				materialize(entry.Model)
-				Effects.Burst(entry.Top.Position + Vector3.new(0, 2, 0), "Sparks", 40, Rarities.Get(entry.Trophy.Rarity).Color)
-				Effects.Confetti(entry.Top.Position + Vector3.new(0, 2, 0), 80)
-				task.delay(1.2, function()
-					if self.View.Near then
-						self:_buildPedestal(entry, true)
-					end
-				end)
+				self:_unlock(entry)
 			else
 				self:_buildPedestal(entry, owned)
 			end
@@ -368,42 +493,20 @@ function TrophyVault:SetActive(active: boolean)
 	local accumulator = 0
 	self.ActiveTrove:Connect(RunService.Heartbeat, function(dt)
 		accumulator += dt
-		if accumulator < (if Effects.IsLow() then 1 / 15 else 1 / 30) then
+		-- Every frame while the vault is seen up close (focus shot, the room, the
+		-- corridor): wing flaps step visibly at 30 Hz. Throttled from further away.
+		local camera = workspace.CurrentCamera
+		local close = self.Focused ~= nil or (camera ~= nil and self.Anchor ~= nil and (camera.CFrame.Position - self.Anchor.Position).Magnitude < 90)
+		local interval = if Effects.IsLow() then (if close then 1 / 30 else 1 / 15) else (if close then 0 else 1 / 30)
+		if accumulator < interval then
 			return
 		end
 		accumulator = 0
 		local t = os.clock()
 		local parts, frames = {}, {}
 		for _, entry in self.Pedestals do
-			local model = entry.Model
-			if model and entry.Top then
-				local spin = model:GetAttribute("SpinAll") or 0.25
-				local root = entry.Top.CFrame * CFrame.Angles(0, t * spin, 0)
-				for _, p in entry.Parts do
-					local part = p.Part
-					local cf = root * p.Home
-					local bob = part:GetAttribute("Bob")
-					if bob then
-						cf = cf + Vector3.new(0, math.sin(t * 2.2) * bob, 0)
-					end
-					local wing = part:GetAttribute("Wing")
-					local hinge = part:GetAttribute("Hinge")
-					if wing and typeof(hinge) == "Vector3" then
-						local h = CFrame.new(hinge)
-						cf = root * h * CFrame.Angles(0, 0, wing * math.sin(t * 7) * 0.45) * h:Inverse() * p.Home
-					elseif part:GetAttribute("Jaw") and typeof(hinge) == "Vector3" then
-						local open = if entry.Breathing then 0.35 else 0.05 + math.max(math.sin(t * 2), 0) * 0.08
-						local h = CFrame.new(hinge)
-						cf = root * h * CFrame.Angles(open, 0, 0) * h:Inverse() * p.Home
-					end
-					if part:GetAttribute("Pulse") and entry.Owned then
-						part.Transparency = 0.1 + 0.2 * (0.5 + 0.5 * math.sin(t * 4))
-					end
-					table.insert(parts, part)
-					table.insert(frames, cf)
-				end
-				table.insert(parts, model.PrimaryPart)
-				table.insert(frames, root)
+			if entry.Model and entry.Top then
+				poseTrophy(entry, t, parts, frames)
 				-- Fire breath for trophies with a mouth (owned only)
 				if entry.Mouth and entry.Owned and t >= entry.NextBreath then
 					entry.NextBreath = t + 3 + math.random() * 2
@@ -424,10 +527,11 @@ function TrophyVault:SetActive(active: boolean)
 		if #parts > 0 then
 			workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
 		end
-		-- Auto close when nobody (locally) is near the vault
+		-- Auto close once the local player has left the vault and its corridor
+		-- (never behind someone still inside: the room reaches 75 studs deep)
 		if self.DoorOpen and not self.DoorBusy and self.Anchor and os.clock() - (self.OpenedAt or 0) > 8 then
 			local root = self.View.Controller:GetRoot()
-			if not root or (root.Position - self.Anchor.Position).Magnitude > 70 then
+			if not root or ((root.Position - self.Anchor.Position).Magnitude > 70 and self.View:RoomAt(root.Position) ~= "TrophyVault") then
 				self:_close()
 			end
 		end
@@ -477,20 +581,39 @@ function TrophyVault:_buy(trophyId: string)
 	local controller = self.View.Controller
 	local item = Shop.Get(trophyId)
 	local entry = self.Pedestals[trophyId]
-	if not item or not entry or self.Buying then
+	if not item or not entry or self.Buying or self.Claiming[trophyId] then
 		return
 	end
 	self.Buying = true
+	self.Claiming[trophyId] = true
+	local button = controller.FactoryHud:GetButton("Buy")
+	if button then
+		button:SetLoading(true)
+	end
 	local result = controller:RequestPurchase(item)
 	self.Buying = false
+	if button then
+		button:SetLoading(false)
+	end
 	if not result.Ok then
+		self.Claiming[trophyId] = nil
+		if self.View.Near then
+			self:_refresh(true)
+		end
 		controller.Hud:Toast(result.Error or "Purchase failed.", "Error")
 		return
 	end
-	controller:CoinFlight(result.Currency, result.Price or 0, entry.Top.Position + Vector3.new(0, 2, 0))
+	-- The cores fly onto the trophy first; it unlocks as they land.
+	local flight = controller:CoinFlight(result.Currency, result.Price or 0, entry.Top.Position + Vector3.new(0, 2, 0))
 	local rarity = Rarities.Get(item.Rarity)
-	controller.Hud:Banner({ Title = item.Name, Subtitle = "Trophy unlocked  ·  " .. rarity.Name, Rarity = item.Rarity, Style = "Big" })
-	CameraDirector.Punch(6)
+	self.Trove:Add(task.delay(flight, function()
+		self.Claiming[trophyId] = nil
+		if self.View.Near then
+			self:_refresh(true)
+		end
+		controller.Hud:Banner({ Title = item.Name, Subtitle = "Trophy unlocked  ·  " .. rarity.Name, Rarity = item.Rarity, Style = "Big" })
+		CameraDirector.Punch(6)
+	end))
 end
 
 function TrophyVault:Focus(trophyId: string)
@@ -521,6 +644,8 @@ function TrophyVault:Focus(trophyId: string)
 end
 
 function TrophyVault:Destroy()
+	-- (drops the pedestal models too, so late unlock callbacks find nothing to touch)
+	self:SetActive(false)
 	self.Trove:Clean()
 end
 

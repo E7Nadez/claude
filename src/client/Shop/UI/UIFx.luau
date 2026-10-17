@@ -3,6 +3,7 @@
 -- shadows, drifting bokeh and typewriter text. Everything is cheap GUI work
 -- (no textures needed) and scales down with Low Graphics.
 
+local GuiService = game:GetService("GuiService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -47,31 +48,56 @@ local function play(instance: Instance, info: TweenInfo, goal: { [string]: any }
 	return tween
 end
 
--- Material-style click ripple from the cursor (or the center on touch).
+-- Cursor position in AbsolutePosition space: GetMouseLocation includes the
+-- top-bar inset, every AbsolutePosition is measured from below it.
+local function mouseInGui(): Vector2
+	return UserInputService:GetMouseLocation() - GuiService:GetGuiInset()
+end
+
+-- Material-style click ripple from the cursor (or the center on touch). It
+-- clips itself to the host's rounded shape, so the host need not clip.
 function UIFx.Ripple(button: GuiObject, color: Color3?)
 	local size = button.AbsoluteSize
-	local mouse = UserInputService:GetMouseLocation()
-	local rel = mouse - button.AbsolutePosition
+	if size.X <= 0 or size.Y <= 0 then
+		return
+	end
+	local rel = mouseInGui() - button.AbsolutePosition
 	if UserInputService.TouchEnabled and not UserInputService.MouseEnabled or rel.X < 0 or rel.Y < 0 or rel.X > size.X or rel.Y > size.Y then
 		rel = size / 2
 	end
 	local diameter = math.max(size.X, size.Y) * 2.4
+	-- ClipsDescendants only clips the rectangle; a CanvasGroup with the host's
+	-- UICorner also rounds the corners (a plain clip frame on Low Graphics).
+	local clip = new(if lowGraphics then "Frame" else "CanvasGroup", {
+		Name = "RippleClip",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Active = false,
+		ZIndex = button.ZIndex + 4,
+		Parent = button,
+	})
+	local hostCorner = button:FindFirstChildOfClass("UICorner")
+	if hostCorner then
+		hostCorner:Clone().Parent = clip
+	end
+	-- Scale units: the host's own UIScale (hover, press) cannot pull it off the cursor.
 	local ripple = new("Frame", {
 		Name = "Ripple",
 		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromOffset(rel.X, rel.Y),
-		Size = UDim2.fromOffset(0, 0),
+		Position = UDim2.fromScale(rel.X / size.X, rel.Y / size.Y),
+		Size = UDim2.fromScale(0, 0),
 		BackgroundColor3 = color or Color3.new(1, 1, 1),
 		BackgroundTransparency = 0.55,
 		ZIndex = button.ZIndex + 4,
-		Parent = button,
+		Parent = clip,
 	}, { corner() })
 	local tween = play(ripple, TweenInfo.new(0.55, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-		Size = UDim2.fromOffset(diameter, diameter),
+		Size = UDim2.fromScale(diameter / size.X, diameter / size.Y),
 		BackgroundTransparency = 1,
 	})
 	tween.Completed:Connect(function()
-		ripple:Destroy()
+		clip:Destroy()
 	end)
 end
 
@@ -293,12 +319,16 @@ function UIFx.Stamp(parent: GuiObject, text: string, color: Color3, duration: nu
 		ZIndex = parent.ZIndex + 10,
 		Parent = parent,
 	})
-	new("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 3, Transparency = 0.3, Parent = label })
+	-- The outline fades with the letters (its Transparency is independent of
+	-- TextTransparency; left alone it shows hollow letters before and after).
+	local stroke = new("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 3, Transparency = 1, Parent = label })
 	local scale = new("UIScale", { Scale = 3, Parent = label })
 	play(scale, TweenInfo.new(0.28, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Scale = 1 })
 	play(label, TweenInfo.new(0.2), { TextTransparency = 0 })
+	play(stroke, TweenInfo.new(0.2), { Transparency = 0.3 })
 	task.delay(duration or 1.1, function()
 		play(scale, TweenInfo.new(0.25, Enum.EasingStyle.Quad), { Scale = 1.3 })
+		play(stroke, TweenInfo.new(0.25), { Transparency = 1 })
 		local fade = play(label, TweenInfo.new(0.25), { TextTransparency = 1 })
 		fade.Completed:Connect(function()
 			label:Destroy()
@@ -306,92 +336,138 @@ function UIFx.Stamp(parent: GuiObject, text: string, color: Color3, duration: nu
 	end)
 end
 
+local GLINT_LEAN = math.tan(math.rad(22))
+
 -- Periodic diagonal glint across a frame. Returns a stop function.
+-- A gradient band sweeping over a full-size overlay that copies the target's
+-- corners, like Foil: it stays inside rounded shapes and needs no
+-- ClipsDescendants (rectangular, and ignored under rotated ancestors).
 function UIFx.Shine(target: GuiObject, interval: number?, width: number?): () -> ()
 	local running = true
+	local half = math.clamp((width or 0.18) / 2, 0.02, 0.3)
 	local glint = new("Frame", {
 		Name = "Glint",
+		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		BackgroundTransparency = 0.6,
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Size = UDim2.new(width or 0.18, 0, 2.2, 0),
-		Position = UDim2.fromScale(-0.4, 0.5),
-		Rotation = 22,
 		ZIndex = target.ZIndex + 6,
+		Active = false,
 		Parent = target,
-	}, {
-		new("UIGradient", {
-			Transparency = NumberSequence.new({
-				NumberSequenceKeypoint.new(0, 1),
-				NumberSequenceKeypoint.new(0.5, 0.15),
-				NumberSequenceKeypoint.new(1, 1),
-			}),
-		}),
 	})
-	local previousClip = target.ClipsDescendants
-	target.ClipsDescendants = true
+	local targetCorner = target:FindFirstChildOfClass("UICorner")
+	if targetCorner then
+		targetCorner:Clone().Parent = glint
+	end
+	local gradient = new("UIGradient", {
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.5 - half, 1),
+			NumberSequenceKeypoint.new(0.5, 0.15),
+			NumberSequenceKeypoint.new(0.5 + half, 1),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+		Rotation = 22,
+		Offset = Vector2.new(-1, 0),
+		Parent = glint,
+	})
 	task.spawn(function()
 		while running and glint.Parent do
-			glint.Position = UDim2.fromScale(-0.4, 0.5)
-			play(glint, TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { Position = UDim2.fromScale(1.4, 0.5) })
-			task.wait((interval or 3.5) + math.random() * 1.5)
+			local size = target.AbsoluteSize
+			if size.X > 0 and size.Y > 0 then
+				-- The gradient stretches with the target: correct its angle so the
+				-- band leans 22° on screen whatever the aspect ratio.
+				gradient.Rotation = math.deg(math.atan(GLINT_LEAN * size.Y / size.X))
+				gradient.Offset = Vector2.new(-1, 0)
+				play(gradient, TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { Offset = Vector2.new(1, 0) })
+				task.wait((interval or 3.5) + math.random() * 1.5)
+			else
+				task.wait(0.25)
+			end
 		end
 	end)
 	return function()
 		running = false
 		glint:Destroy()
-		target.ClipsDescendants = previousClip
 	end
 end
 
--- Parallax tilt while hovered: layers move with the cursor, the container
--- leans a little. layers = { { Object, Strength } }. Returns a cleanup.
+-- Parallax tilt while hovered (mouse only): layers move with the cursor.
+-- layers = { { Object, Strength } }. maxRotation also leans the container,
+-- but a rotated ancestor switches ClipsDescendants off for everything inside
+-- it, so the lean is opt-in (default 0). Returns a cleanup.
 function UIFx.Tilt(container: GuiObject, layers: { { any } }, maxRotation: number?): () -> ()
+	local lean = maxRotation or 0
 	local bases = {}
 	for i, layer in layers do
 		bases[i] = (layer[1] :: GuiObject).Position
 	end
-	local hovered = false
 	local connection: RBXScriptConnection? = nil
-	local function reset()
-		for i, layer in layers do
-			play(layer[1], TweenInfo.new(0.35, Enum.EasingStyle.Quint), { Position = bases[i] })
+	local settling: { Tween } = {}
+	local function stopSettling()
+		for _, tween in settling do
+			tween:Cancel()
 		end
-		play(container, TweenInfo.new(0.35, Enum.EasingStyle.Quint), { Rotation = 0 })
+		table.clear(settling)
+	end
+	local function reset()
+		if connection then
+			connection:Disconnect()
+			connection = nil
+		end
+		stopSettling()
+		for i, layer in layers do
+			table.insert(settling, play(layer[1], TweenInfo.new(0.35, Enum.EasingStyle.Quint), { Position = bases[i] }))
+		end
+		if lean ~= 0 then
+			table.insert(settling, play(container, TweenInfo.new(0.35, Enum.EasingStyle.Quint), { Rotation = 0 }))
+		end
 	end
 	local enter = container.MouseEnter:Connect(function()
-		if lowGraphics or hovered then
+		-- Taps emulate MouseEnter without a reliable MouseLeave.
+		if lowGraphics or connection or UserInputService:GetLastInputType() == Enum.UserInputType.Touch then
 			return
 		end
-		hovered = true
+		-- A settle still easing back would fight the per-frame writes.
+		stopSettling()
+		local gui = container:FindFirstAncestorWhichIsA("LayerCollector")
 		connection = RunService.RenderStepped:Connect(function()
 			local size = container.AbsoluteSize
-			if size.X <= 0 then
+			if size.X <= 0 or size.Y <= 0 then
 				return
 			end
-			local mouse = UserInputService:GetMouseLocation()
-			local m = (mouse - (container.AbsolutePosition + size / 2)) / size
+			local m = (mouseInGui() - (container.AbsolutePosition + size / 2)) / size
+			-- Missed MouseLeave (gui hidden, scrolled away, cursor long gone): settle back.
+			if lowGraphics or math.abs(m.X) > 0.75 or math.abs(m.Y) > 0.75 or not container.Visible or (gui and not gui.Enabled) then
+				reset()
+				return
+			end
 			m = Vector2.new(math.clamp(m.X, -0.5, 0.5), math.clamp(m.Y, -0.5, 0.5))
 			for i, layer in layers do
 				local strength = layer[2]
 				layer[1].Position = bases[i] + UDim2.fromOffset(m.X * strength, m.Y * strength)
 			end
-			container.Rotation = m.X * (maxRotation or 3)
+			if lean ~= 0 then
+				container.Rotation = m.X * lean
+			end
 		end)
 	end)
 	local leave = container.MouseLeave:Connect(function()
-		hovered = false
 		if connection then
-			connection:Disconnect()
-			connection = nil
+			reset()
 		end
-		reset()
 	end)
 	return function()
 		enter:Disconnect()
 		leave:Disconnect()
 		if connection then
 			connection:Disconnect()
+			connection = nil
+			for i, layer in layers do
+				layer[1].Position = bases[i]
+			end
+			if lean ~= 0 then
+				container.Rotation = 0
+			end
 		end
 	end
 end
@@ -507,6 +583,21 @@ function UIFx.Typewriter(label: TextLabel, duration: number?)
 	end)
 end
 
+-- { size, transparency } per disc. The stacked opacity falls off smoothly,
+-- roughly 0.6 * (1 - r^2)^1.5, in small steps, so the halo reads as a soft
+-- glow instead of a bullseye of hard-edged rings.
+local GLOW_RINGS = {
+	{ 1, 0.98 },
+	{ 0.92, 0.95 },
+	{ 0.84, 0.93 },
+	{ 0.76, 0.92 },
+	{ 0.68, 0.9 },
+	{ 0.58, 0.87 },
+	{ 0.46, 0.85 },
+	{ 0.32, 0.81 },
+}
+local GLOW_RINGS_LOW = { { 1, 0.95 }, { 0.8, 0.82 }, { 0.6, 0.77 }, { 0.38, 0.74 } }
+
 -- Soft radial glow made of concentric circles (no textures needed).
 function UIFx.Glow(parent: GuiObject, color: Color3, scale: number?, intensity: number?): Frame
 	local holder = new("Frame", {
@@ -519,14 +610,15 @@ function UIFx.Glow(parent: GuiObject, color: Color3, scale: number?, intensity: 
 		Parent = parent,
 	})
 	local strength = intensity or 1
-	for i, ring in { { 1, 0.9 }, { 0.78, 0.84 }, { 0.56, 0.78 }, { 0.36, 0.72 } } do
+	local rings = if lowGraphics then GLOW_RINGS_LOW else GLOW_RINGS
+	for i, ring in rings do
 		new("Frame", {
 			Name = "Ring" .. i,
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.fromScale(0.5, 0.5),
 			Size = UDim2.fromScale(ring[1], ring[1]),
 			BackgroundColor3 = color,
-			BackgroundTransparency = 1 - (1 - ring[2]) * strength,
+			BackgroundTransparency = math.clamp(1 - (1 - ring[2]) * strength, 0, 1),
 			ZIndex = parent.ZIndex,
 			Parent = holder,
 		}, { corner() })
