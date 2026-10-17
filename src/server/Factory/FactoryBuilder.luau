@@ -235,8 +235,11 @@ local function belt(ctx: Ctx, parent: Instance, name: string, from: Vector3, to:
 	base:SetAttribute("BeltLength", length)
 	base:SetAttribute("BeltStart", world(ctx, from))
 	local slats = Builder.Folder("Slats", base)
-	local spacing = 2.4
-	local count = math.floor(length / spacing)
+	-- The client slides every slat forward by up to one spacing before it wraps;
+	-- fit the spacing so the last slat's front edge (slats are 0.55 spacing long)
+	-- stops exactly at the belt end instead of overhanging into the air.
+	local count = math.max(math.floor(length / 2.4 - 0.775), 1)
+	local spacing = length / (count + 0.775)
 	for i = 0, count - 1 do
 		local pos = from + dir.Unit * (i * spacing + spacing / 2)
 		local slat = box(ctx, slats, "Slat", pos + Vector3.new(0, 0.06, 0), Vector3.new(width - 0.4, 0.12, spacing * 0.55), {
@@ -601,7 +604,6 @@ local function buildRoof(ctx: Ctx)
 		Material = Enum.Material.Neon,
 		Color = ctx.theme.NeonAlt,
 		CanCollide = false,
-		Tags = { "FactoryNeon" },
 	})
 	mouth:SetAttribute("Direction", ctx.origin:VectorToWorldSpace(dir))
 
@@ -744,13 +746,23 @@ local function buildTestChamber(ctx: Ctx)
 		lane:SetAttribute("Skin", "")
 		lane:SetAttribute("EndsAt", 0)
 		belt(ctx, lane, "Belt", Vector3.new(config.BeltStartX, config.BeltHeight, z), Vector3.new(config.BeltEndX, config.BeltHeight, z), config.BeltWidth, config.BeltHeight, 5)
-		-- hatch housing reaches back to the side wall (inner face x = -99): no gap behind it
-		local hatch = box(ctx, lane, "Hatch", Vector3.new(config.BeltStartX - 2, 4, z), Vector3.new(2, 6, config.BeltWidth + 2), {
+		-- Hatch housing on the floor, from the side wall (inner face x = -99) to the
+		-- belt start, so trash leaves it straight onto the belt; its dark mouth sits
+		-- on the front face, where the trash comes out.
+		local hatch = box(ctx, lane, "Hatch", Vector3.new(config.BeltStartX - 1.5, 3.5, z), Vector3.new(3, 7, config.BeltWidth + 2), {
 			Color = Color3.fromRGB(20, 20, 26),
 			Material = Enum.Material.SmoothPlastic,
 		})
 		hatch:SetAttribute("Lane", i)
-		box(ctx, lane, "HatchFrame", Vector3.new(config.BeltStartX - 1.7, 7.4, z), Vector3.new(2.6, 0.8, config.BeltWidth + 3), neon(ctx, ctx.theme.NeonAlt))
+		box(ctx, lane, "HatchMouth", Vector3.new(config.BeltStartX + 0.05, config.BeltHeight + 1.82, z), Vector3.new(0.1, 3.6, config.BeltWidth - 1), {
+			Color = Color3.fromRGB(6, 6, 8),
+			Material = Enum.Material.SmoothPlastic,
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			CastShadow = false,
+		})
+		box(ctx, lane, "HatchFrame", Vector3.new(config.BeltStartX - 1.2, 7.4, z), Vector3.new(3.6, 0.8, config.BeltWidth + 3), neon(ctx, ctx.theme.NeonAlt))
 		local pad = cylY(ctx, lane, "Pad", Vector3.new(config.PadX, 0.2, z), 0.4, 6, trim(ctx))
 		pad:SetAttribute("Lane", i)
 		cylY(ctx, lane, "PadGlow", Vector3.new(config.PadX, 0.17, z), 0.3, 6.6, neon(ctx))
@@ -1024,6 +1036,22 @@ local function buildVault(ctx: Ctx)
 			Material = ctx.theme.WallMaterial,
 		})
 	end
+	-- The frame ring's bottom arc is a 1.4-stud sill across the round opening
+	-- (z door - 2.5 .. door - 0.3): trim ramps on both sides lead over it, so
+	-- walking through the open door is smooth. They stay below the door disc.
+	local sill = door.Y - (config.DoorRadius + 0.1)
+	local rampLength = 2.2
+	for _, side in { -1, 1 } do
+		local edge = if side < 0 then door.Z - 2.5 else door.Z - 0.3
+		part(ctx, vault, {
+			Name = "Threshold",
+			ClassName = "WedgePart",
+			Size = Vector3.new(4, sill, rampLength),
+			CFrame = CFrame.new(door.X, sill / 2, edge + side * rampLength / 2) * (if side < 0 then CFrame.identity else CFrame.Angles(0, math.pi, 0)),
+			Color = ctx.theme.Trim,
+			Material = ctx.theme.TrimMaterial,
+		})
+	end
 	box(ctx, vault, "DoorAnchor", Vector3.new(door.X, door.Y, door.Z - 1.4), Vector3.new(0.5, 0.5, 0.5), {
 		Transparency = 1,
 		CanCollide = false,
@@ -1035,7 +1063,8 @@ local function buildVault(ctx: Ctx)
 	})
 	prompt(console, "Vault", nil, "Open", "Trophy Vault", 14)
 	sign(ctx, vault, "Title", Vector3.new(0, 26, 148.6), Vector3.new(30, 5, 0.6), CFrame.identity, "TROPHY VAULT", Enum.NormalId.Front, Color3.fromRGB(255, 210, 80))
-	box(ctx, vault, "Carpet", Vector3.new(0, 0.06, 185), Vector3.new(6, 0.1, 68), {
+	-- starts behind the vault-side threshold ramp (ends at z 151.9)
+	box(ctx, vault, "Carpet", Vector3.new(0, 0.06, 185.5), Vector3.new(6, 0.1, 67), {
 		Color = Color3.fromRGB(150, 24, 40),
 		Material = Enum.Material.Fabric,
 		CanCollide = false,

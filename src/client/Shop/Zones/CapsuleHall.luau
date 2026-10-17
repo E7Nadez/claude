@@ -40,7 +40,7 @@ local CLAW_TOP = 3.8
 local CLAW_HEIGHT = 2.2
 local CLAW_REACH = 2.6
 local CLAW_RELEASE = 2.6 -- release point, towards the chute
-local HOLD = 1.2 -- capsule centre below the claw head while carried
+local HOLD = 1.5 -- capsule centre below the claw head while carried (prong tips on its upper half)
 local GRIP = 0.3 -- prong opening while holding (tips rest on the capsule)
 
 local function ease(t: number, style: Enum.EasingStyle?): number
@@ -417,6 +417,8 @@ function CapsuleHall:Open(capsuleId: string)
 	end
 	local pet = Pets.Get(result.PetId)
 	if not pet then
+		-- No show will release the coin counter RequestPurchase held.
+		controller.Hud:ReleaseCurrency(item.Currency)
 		self.Opening = false
 		return
 	end
@@ -801,7 +803,8 @@ function CapsuleHall:_play(machine, pet: Pets.Pet, result: { [string]: any })
 		end
 		cine:End()
 		CameraDirector.StopFollow()
-		if machine.Claw and machine.ClawPos then
+		-- (Not once the hall was torn down mid-show: a destroyed claw has no parts.)
+		if machine.Claw and machine.Claw.Parent and machine.ClawPos then
 			poseClaw(machine.Claw, machine.ClawPos, machine.ClawTop, 0.6)
 		end
 		controller.Hud:ReleaseCurrency(result.Currency or "Coins")

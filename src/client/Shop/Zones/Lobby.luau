@@ -33,6 +33,8 @@ local Lobby = {}
 Lobby.__index = Lobby
 
 local CRATE_SIZE = 4
+local QUARTER = math.pi / 2 -- the square crate looks the same after a quarter turn
+local WAIT_GLYPH = "⏳"
 
 local function animate(seq, duration: number, fn: (number) -> ()): boolean
 	local start = os.clock()
@@ -62,6 +64,10 @@ function Lobby.new(view)
 	self.NightSign = view:Find("Lobby/NightStand/NightSign") :: BasePart?
 	self.Crate = nil :: Model?
 	self.State = "None"
+	self.BobStart = os.clock()
+	self.NightOn = nil :: boolean?
+	self.FlickerUntil = 0
+	self.PanelKey = nil :: string?
 	self.Item = Shop.Get(Shop.DailyCrate.Id)
 	self.Trove:Connect(view.Controller.ClientData.Changed, function()
 		if self.Focused and self.State ~= "Opening" then
@@ -113,9 +119,9 @@ function Lobby:_buildCrate(): Model
 	return model
 end
 
-function Lobby:_placeCrate(cf: CFrame)
-	local crate = self.Crate
-	if not crate then
+function Lobby:_placeCrate(cf: CFrame, target: Model?)
+	local crate = target or self.Crate
+	if not crate or not crate.Parent then
 		return
 	end
 	local body = crate.PrimaryPart :: BasePart
@@ -129,55 +135,135 @@ function Lobby:_placeCrate(cf: CFrame)
 	workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
 end
 
+-- Sinks the crate into the pad. Every part moves down by the same offset, so an
+-- opened lid stays open instead of snapping shut; an open lid overhangs the
+-- pad, so it fades out on the way down. Returns false if interrupted.
+function Lobby:_sinkCrate(crate: Model, seq, fadeLid: boolean): boolean
+	local parts, starts = {}, {}
+	for _, p in crate:GetChildren() do
+		if p:IsA("BasePart") then
+			table.insert(parts, p)
+			table.insert(starts, p.CFrame)
+		end
+	end
+	local lid = if fadeLid then crate:FindFirstChild("Lid") :: BasePart? else nil
+	local frames = {}
+	return animate(seq, 0.6, function(a)
+		if not crate.Parent then
+			return
+		end
+		-- deep enough that the bobbing lid's top ends below the pad surface
+		local offset = Vector3.new(0, -CRATE_SIZE * 1.25 * a * a, 0)
+		for i, cf in starts do
+			frames[i] = cf + offset
+		end
+		workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
+		if lid then
+			lid.LocalTransparencyModifier = math.min(a / 0.7, 1)
+		end
+	end)
+end
+
 function Lobby:_padCFrame(): CFrame
 	local pad = self.Pad :: BasePart
 	return CFrame.new(pad.Position + Vector3.new(0, pad.Size.Y / 2 + CRATE_SIZE * 0.4, 0)) * self.View.Origin.Rotation
 end
 
--- The conveyor brings a fresh crate out of the hatch.
+-- The conveyor brings a fresh crate out of the hatch: it rides the belt at the
+-- slats' speed, glides off the end onto the pad and rocks to a stop.
 function Lobby:_deliver(instant: boolean)
 	if not self.Pad or not self.Belt or self.State ~= "None" then
 		return
 	end
-	self.Crate = self:_buildCrate()
-	self.ActiveTrove:Add(self.Crate)
-	if instant then
+	local crate = self:_buildCrate()
+	self.Crate = crate
+	self.ActiveTrove:Add(crate)
+	local belt = self.Belt :: BasePart
+	local finish = self:_padCFrame()
+	local beltStart = belt:GetAttribute("BeltStart")
+	if instant or typeof(beltStart) ~= "Vector3" then
 		self.State = "Waiting"
-		self:_placeCrate(self:_padCFrame())
+		self.BobStart = os.clock()
+		self:_placeCrate(finish, crate)
 		return
 	end
 	self.State = "Delivering"
 	local hatch = self.Hatch
-	local start = self.Belt:GetAttribute("BeltStart") :: Vector3
-	local finish = self:_padCFrame()
-	local from = CFrame.new(start + Vector3.new(0, CRATE_SIZE * 0.4, 0)) * self.View.Origin.Rotation
+	local start = beltStart + Vector3.new(0, CRATE_SIZE * 0.4, 0)
+	local path = finish.Position - start
+	local length = path.Magnitude
+	local dir = path.Unit
+	local speed = math.max(belt:GetAttribute("BeltSpeed") or 5, 0.5)
+	local beltLength = math.clamp(belt:GetAttribute("BeltLength") or (length - 3), 0, length)
+	-- Starts behind the dark recess in the wall, so it comes out of the opening.
+	local back = CRATE_SIZE / 2 + 1.25
+	local ride = back + beltLength -- carried by the slats
+	local glide = length - beltLength -- off the belt end onto the pad
+	local rideTime = ride / speed
+	local glideTime = math.max(2 * glide / speed, 0.01) -- Quad Out, starting at belt speed
+	local opening = if hatch then 0.3 else 0
+	-- Path distance of the crate centre once its back has cleared the hatch.
+	local clear = if hatch then (hatch.Position - start):Dot(dir) + hatch.Size.X / 2 + CRATE_SIZE / 2 + 0.3 else 0
+	-- The stop: tips forward onto its front bottom edge and drops back.
+	local localDir = finish:VectorToObjectSpace(dir)
+	local edge = CFrame.new(localDir * (CRATE_SIZE / 2) - Vector3.new(0, CRATE_SIZE * 0.4, 0))
+	local tiltAxis = Vector3.yAxis:Cross(localDir).Unit
+	self:_placeCrate(CFrame.new(start - dir * back) * finish.Rotation, crate)
 	if hatch then
-		hatch.LocalTransparencyModifier = 1
 		Audio.PlayAt("Clank", hatch.Position)
 	end
-	task.spawn(function()
+	self.ActiveTrove:Add(task.spawn(function()
 		local t0 = os.clock()
-		local duration = 4.5
-		while os.clock() - t0 < duration do
-			if not self.Crate then
+		local clearedAt: number? = nil
+		while true do
+			if self.Crate ~= crate then
 				return
 			end
-			local a = (os.clock() - t0) / duration
-			local p = from.Position:Lerp(finish.Position, a)
-			self:_placeCrate(CFrame.new(p) * finish.Rotation * CFrame.Angles(0, 0, math.sin(a * 30) * 0.02))
+			local elapsed = os.clock() - t0
+			local t = elapsed - opening
+			local d = 0
+			if t >= rideTime then
+				local g = math.min((t - rideTime) / glideTime, 1)
+				d = ride + glide * (1 - (1 - g) * (1 - g))
+			elseif t > 0 then
+				d = t * speed
+			end
+			if hatch then
+				-- fades open before the crate moves, closes again once it is through
+				if not clearedAt and d - back >= clear then
+					clearedAt = elapsed
+					Audio.PlayAt("Clank", hatch.Position, { Volume = 0.5 })
+				end
+				hatch.LocalTransparencyModifier = if clearedAt then 1 - math.min((elapsed - clearedAt) / 0.3, 1) else math.min(elapsed / opening, 1)
+			end
+			local rattle = if t > 0 and t < rideTime then math.sin(t * 6.5) * 0.02 else 0
+			self:_placeCrate(CFrame.new(start + dir * (d - back)) * finish.Rotation * CFrame.Angles(0, 0, rattle), crate)
+			if t >= rideTime + glideTime then
+				break
+			end
 			RunService.Heartbeat:Wait()
-		end
-		if not self.Crate then
-			return
 		end
 		if hatch then
 			hatch.LocalTransparencyModifier = 0
 		end
-		self:_placeCrate(finish)
-		Effects.Burst(finish.Position, "Glow", 16, Theme.Colors.Gold)
+		Effects.Burst(finish:PointToWorldSpace(Vector3.new(0, CRATE_SIZE * 0.65, 0)), "Glow", 16, Theme.Colors.Gold)
 		Audio.PlayAt("Pop", finish.Position)
+		local s0 = os.clock()
+		while true do
+			if self.Crate ~= crate then
+				return
+			end
+			local a = math.min((os.clock() - s0) / 0.35, 1)
+			self:_placeCrate(finish * edge * CFrame.fromAxisAngle(tiltAxis, math.sin(a * math.pi) * 0.05) * edge:Inverse(), crate)
+			if a >= 1 then
+				break
+			end
+			RunService.Heartbeat:Wait()
+		end
 		self.State = "Waiting"
-	end)
+		self.BobStart = os.clock()
+		self:_refreshPanel()
+	end))
 end
 
 function Lobby:_updateScreen()
@@ -229,14 +315,45 @@ function Lobby:_updateNightSign()
 	local label = sign:FindFirstChild("Sign")
 	local text = label and label:FindFirstChild("Text") :: TextLabel?
 	local night = DayNight.IsNight()
+	local switchedOn = night and self.NightOn == false
+	self.NightOn = night
 	if text then
 		text.Text = if night then "🌙 NIGHT DEALS" else "NIGHT DEALS · AFTER DARK"
-		text.TextColor3 = if night then self.View.Theme.NightNeon else Theme.Colors.Muted
-		text.TextTransparency = if night then 0 else 0.4
+		-- By day an unlit but readable tube.
+		text.TextColor3 = if night then self.View.Theme.NightNeon else Theme.Colors.SubText
+		text.TextTransparency = if night then 0 else 0.15
 	end
 	local gui = label :: SurfaceGui?
 	if gui and gui:IsA("SurfaceGui") then
-		gui.Brightness = if night then 3 else 0.6
+		if switchedOn and not Effects.ReduceMotion() then
+			-- the neon flickers on at dusk
+			self.FlickerUntil = os.clock() + 0.6
+			self.ActiveTrove:Add(task.spawn(function()
+				for _, brightness in { 0.4, 2.6, 0.7, 3, 1.4, 3 } do
+					gui.Brightness = brightness
+					task.wait(0.06 + math.random() * 0.04)
+				end
+			end))
+		elseif os.clock() >= self.FlickerUntil then
+			gui.Brightness = if night then 3 else 1.2
+		end
+	end
+end
+
+-- Today's crate was opened elsewhere (the classic Deals tab): it sinks into
+-- the pad instead of waiting there until tomorrow.
+function Lobby:_retire()
+	local crate = self.Crate
+	if not crate then
+		self.State = "None"
+		return
+	end
+	self.State = "Leaving"
+	self:_sinkCrate(crate, { Stopped = false }, false)
+	if self.Crate == crate then
+		crate:Destroy()
+		self.Crate = nil
+		self.State = "None"
 	end
 end
 
@@ -244,6 +361,8 @@ function Lobby:SetActive(active: boolean)
 	self.ActiveTrove:Clean()
 	self.Crate = nil
 	self.State = "None"
+	self.NightOn = nil
+	self.FlickerUntil = 0
 	if self.Hatch then
 		self.Hatch.LocalTransparencyModifier = 0
 	end
@@ -255,24 +374,68 @@ function Lobby:SetActive(active: boolean)
 	end
 	self.ActiveTrove:Add(task.spawn(function()
 		while true do
-			if self.State == "None" and self:_available() then
-				self:_deliver(false)
+			local available = self:_available()
+			if self.State == "None" and available then
+				-- (only animated where it can be seen: the crate starts inside the wall)
+				self:_deliver(not self.View.Inside)
+			elseif self.State == "Waiting" and not available then
+				self:_retire()
 			end
 			self:_updateScreen()
 			self:_updateNightSign()
+			self:_refreshPanel()
 			task.wait(0.5)
 		end
 	end))
-	local t0 = os.clock()
 	self.ActiveTrove:Connect(RunService.Heartbeat, function()
 		if self.State == "Waiting" and self.Crate then
-			local t = os.clock() - t0
-			self:_placeCrate(self:_padCFrame() * CFrame.new(0, 0.15 + math.sin(t * 2) * 0.12, 0) * CFrame.Angles(0, t * 0.5, 0))
+			-- Eases into the bob from the resting pose (no height / yaw jump).
+			local t = os.clock() - self.BobStart
+			local k = math.min(t / 0.8, 1)
+			k = k * k * (3 - 2 * k)
+			self:_placeCrate(self:_padCFrame() * CFrame.new(0, k * (0.15 + math.sin(t * 2) * 0.12), 0) * CFrame.Angles(0, t * 0.5 * k, 0))
 		end
 	end)
 end
 
 -- Focus + opening --------------------------------------------------------------------------
+
+local function nextCrateText(): string
+	return "Next crate in " .. Format.Clock(DayNight.SecondsUntilNextDay(workspace:GetServerTimeNow()))
+end
+
+-- What the panel shows. It is rebuilt only when this changes.
+function Lobby:_panelKey(available: boolean): string
+	local data = self.View.Controller.ClientData:Get()
+	local affordable = data ~= nil and self.Item ~= nil and Shop.CanAfford(self.Item :: any, data)
+	return tostring(available) .. "/" .. tostring(affordable) .. "/" .. tostring(self.State == "Waiting")
+end
+
+-- Keeps an open panel current: rebuilt when the crate lands or the day
+-- rolls over, the countdown on the button ticks in place.
+function Lobby:_refreshPanel()
+	if not self.Focused or self.State == "Opening" then
+		return
+	end
+	local available = self:_available()
+	if self:_panelKey(available) ~= self.PanelKey then
+		self:_showPanel()
+	elseif not available then
+		local button = self.View.Controller.FactoryHud:GetButton("Open")
+		if button then
+			button:SetText(WAIT_GLYPH .. "  " .. nextCrateText())
+		end
+	end
+end
+
+-- Camera shot on the crate pad. Without a duration it glides for as long as
+-- the distance needs (the camera may be far away).
+function Lobby:_focusCamera(duration: number?)
+	local pad = (self.Pad :: BasePart).Position
+	local camPos = pad + self.View.Origin:VectorToWorldSpace(Vector3.new(12, 7, 10))
+	local glide = duration or math.clamp((workspace.CurrentCamera.CFrame.Position - camPos).Magnitude / 45, 0.7, 1.6)
+	CameraDirector.GlideTo(CFrame.lookAt(camPos, pad + Vector3.new(0, 2, 0)), glide, if glide > 0.75 then Enum.EasingStyle.Sine else Enum.EasingStyle.Quint, 60)
+end
 
 function Lobby:_showPanel()
 	local controller = self.View.Controller
@@ -282,7 +445,8 @@ function Lobby:_showPanel()
 		return
 	end
 	local available = self:_available()
-	local remaining = DayNight.SecondsUntilNextDay(workspace:GetServerTimeNow())
+	local ready = self.State == "Waiting"
+	self.PanelKey = self:_panelKey(available)
 	controller.FactoryHud:ShowPanel({
 		Title = "Mystery Crate",
 		Rarity = item.Rarity,
@@ -291,14 +455,15 @@ function Lobby:_showPanel()
 			"🪙 2-6x price  ·  ⚡ boosts  ·  🐾 pets  ·  🎨 cosmetics  ·  👑 boss cores",
 		},
 		Price = if available then { Amount = Shop.GetPrice(item, data), Currency = item.Currency, Affordable = Shop.CanAfford(item, data) } else nil,
-		Status = if available then nil else "Next crate in " .. Format.Clock(remaining),
+		Status = if available then nil else "Today's crate has been opened.",
 		Buttons = {
 			{
 				Id = "Open",
-				Text = if available then "Open Crate" else "Come back later",
-				Glyph = "📦",
+				-- (the countdown ticks in place, see _refreshPanel)
+				Text = if not available then nextCrateText() elseif ready then "Open Crate" else "Arriving…",
+				Glyph = if available then "📦" else WAIT_GLYPH,
 				Style = "Gold",
-				Enabled = available and Shop.CanAfford(item, data) and self.State == "Waiting",
+				Enabled = available and Shop.CanAfford(item, data) and ready,
 				OnClick = function()
 					self:_open()
 				end,
@@ -329,9 +494,7 @@ function Lobby:Focus()
 		return
 	end
 	self.Focused = true
-	local pad = (self.Pad :: BasePart).Position
-	local camPos = pad + self.View.Origin:VectorToWorldSpace(Vector3.new(12, 7, 10))
-	CameraDirector.GlideTo(CFrame.lookAt(camPos, pad + Vector3.new(0, 2, 0)), 0.7, Enum.EasingStyle.Quint, 60)
+	self:_focusCamera(0.7)
 	controller.FactoryHud:SetHint("[Back] Back")
 	self:_showPanel()
 end
@@ -358,30 +521,60 @@ end
 
 function Lobby:_open()
 	local controller = self.View.Controller
+	local hud = controller.Hud
 	local item = self.Item
-	if not item or self.State ~= "Waiting" or controller:IsBusy() then
+	local crate = self.Crate
+	if not item or not crate or self.State ~= "Waiting" or controller:IsBusy() then
 		return
 	end
 	self.State = "Opening"
+	local frozenAt = os.clock()
 	local button = controller.FactoryHud:GetButton("Open")
 	if button then
 		button:SetLoading(true)
+	end
+	-- The synced balance already contains the reward. RequestPurchase freezes
+	-- the price counter; a boss core can be the reward too, so those counters
+	-- stay frozen as well until the lid has opened.
+	local shownBefore = hud:ShownCurrency(item.Currency)
+	local held = {}
+	for _, id in Currencies.Stored do
+		if id ~= item.Currency then
+			hud:HoldCurrency(id, hud:ShownCurrency(id))
+			table.insert(held, id)
+		end
 	end
 	local result = controller:RequestPurchase(item)
 	if button then
 		button:SetLoading(false)
 	end
-	if not result.Ok or not result.Reward then
-		self.State = "Waiting"
-		controller.Hud:Toast(result.Error or "Could not open the crate.", "Error")
+	local reward = if result.Ok then result.Reward else nil
+	local rewardCurrency: string? = if reward and (reward.Kind == "Coins" or reward.Kind == "BossCore") then reward.Currency or "Coins" else nil
+	for _, id in held do
+		if id ~= rewardCurrency then
+			hud:ReleaseCurrency(id)
+		end
+	end
+	if not reward then
+		if result.Ok then
+			-- No show will release the counter RequestPurchase held.
+			hud:ReleaseCurrency(item.Currency)
+		end
+		-- (unless the zone was reset while the request was in flight)
+		if (self.State :: string) == "Opening" then
+			self.State = "Waiting"
+			self.BobStart += os.clock() - frozenAt -- the bob resumes where it froze
+		end
+		hud:Toast(result.Error or "Could not open the crate.", "Error")
 		return
 	end
-	local reward = result.Reward
 	local rarity = Rarities.Get(reward.Rarity)
 	local profile = Sequences.Get(reward.Rarity)
 	local glyph, text = rewardText(reward)
+	local currency = result.Currency or item.Currency
 	local seq = Sequence.new("Crate")
 	local shown = false
+	local pendingRelease: string? = nil
 	local padCf = self:_padCFrame()
 
 	local function show()
@@ -389,104 +582,195 @@ function Lobby:_open()
 			return
 		end
 		shown = true
-		controller.Hud:Banner({ Title = text, Subtitle = "Mystery Crate  ·  " .. rarity.Name, Rarity = reward.Rarity, Style = profile.Banner })
+		hud:Banner({ Title = text, Subtitle = "Mystery Crate  ·  " .. rarity.Name, Rarity = reward.Rarity, Style = profile.Banner })
 		Effects.Confetti(padCf.Position + Vector3.new(0, 3, 0), profile.Confetti, { rarity.Gradient[1], rarity.Gradient[2], Theme.Colors.Gold })
-		if reward.Kind == "Coins" or reward.Kind == "BossCore" then
+		if rewardCurrency then
 			local from = Effects.ToScreen(padCf.Position + Vector3.new(0, 3, 0))
-			local anchor = controller.Hud:GetCurrencyAnchor(reward.Currency or "Coins")
+			local anchor = hud:GetCurrencyAnchor(rewardCurrency)
 			if anchor then
-				controller.Hud:HoldCurrency(reward.Currency or "Coins", controller.Hud:ShownCurrency(reward.Currency or "Coins"))
+				hud:HoldCurrency(rewardCurrency, hud:ShownCurrency(rewardCurrency))
 				local duration = Effects.CoinFlight(from, Effects.GuiCenter(anchor), 14, glyph)
+				pendingRelease = rewardCurrency
 				task.delay(duration, function()
-					controller.Hud:ReleaseCurrency(reward.Currency or "Coins", 0.8)
+					hud:ReleaseCurrency(rewardCurrency, 0.8)
 				end)
 			end
 		end
 	end
 
+	-- Coins fly from the HUD into the crate. The counter only counts the price
+	-- off (a coin reward is counted up by show() when its coins land).
+	local function pay()
+		local price = result.Price or 0
+		local anchor = hud:GetCurrencyAnchor(currency)
+		local duration = 0
+		if anchor and price > 0 then
+			local info = Currencies.Get(currency)
+			local to = Effects.ToScreen(padCf.Position + Vector3.new(0, 2, 0))
+			duration = Effects.CoinFlight(Effects.GuiCenter(anchor), to, math.clamp(math.floor(math.log10(price + 1) * 2.5), 4, 16), info and info.Glyph)
+		end
+		hud:ReleaseCurrency(currency, duration, shownBefore - price)
+	end
+
 	controller:BeginShow(seq)
 	local cine = Cinematics.Begin({ Bloom = 0.6 + rarity.Rank * 0.06 })
 	cine:Focus(padCf.Position + Vector3.new(0, 2, 0))
+	if not self.Focused then
+		-- Focus mode was left while the request was in flight (Back, travel):
+		-- bring the camera back to the crate for the show.
+		self:_focusCamera()
+	end
 	seq:Run(function(s)
-		controller:CoinFlight(result.Currency or "Coins", result.Price or 0, padCf.Position + Vector3.new(0, 2, 0))
-		if not s:Wait(0.8) then
+		pay()
+		-- the idle bob settles back onto the pad (nearest quarter turn)
+		local settled = padCf
+		local body = crate.PrimaryPart
+		if body then
+			local from = body.CFrame
+			local _, yaw = padCf:ToObjectSpace(from):ToEulerAnglesYXZ()
+			settled = padCf * CFrame.Angles(0, math.round(yaw / QUARTER) * QUARTER, 0)
+			if not animate(s, 0.5, function(a)
+				self:_placeCrate(from:Lerp(settled, TweenService:GetValue(a, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)), crate)
+			end) then
+				return
+			end
+		end
+		if not s:Wait(0.3) then
 			return
 		end
 		-- wobble
 		for i = 1, profile.CapsuleWobble do
 			if not animate(s, 0.3, function(a)
-				self:_placeCrate(padCf * CFrame.Angles(0, 0, math.sin(a * math.pi * 4) * (0.06 + i * 0.03)))
+				self:_placeCrate(settled * CFrame.Angles(0, 0, math.sin(a * math.pi * 4) * (0.06 + i * 0.03)), crate)
 			end) then
 				return
 			end
 			Audio.Play("Tick", { Speed = 1 + i * 0.25 })
 		end
-		-- lid flies open + light beam
-		local crate = self.Crate
-		local lid = crate and crate:FindFirstChild("Lid") :: BasePart?
+		-- lid flies open, hinged on the far edge (it swings up and away from the
+		-- camera) + light pillar
+		local lid = crate:FindFirstChild("Lid") :: BasePart?
 		if lid then
-			local hinge = padCf * CFrame.new(0, CRATE_SIZE * 0.5, CRATE_SIZE / 2)
+			local hinge = padCf * CFrame.new(0, CRATE_SIZE * 0.4, -(CRATE_SIZE + 0.2) / 2)
 			local rel = hinge:ToObjectSpace(lid.CFrame)
-			if not animate(s, 0.35, function(a)
-				lid.CFrame = hinge * CFrame.Angles(-a * 2.2, 0, 0) * rel
+			if not animate(s, 0.4, function(a)
+				lid.CFrame = hinge * CFrame.Angles(-TweenService:GetValue(a, Enum.EasingStyle.Back, Enum.EasingDirection.Out) * 2.2, 0, 0) * rel
 			end) then
 				return
 			end
 		end
+		local pillar = CFrame.new(padCf.Position + Vector3.new(0, 2, 0)) * CFrame.Angles(0, 0, math.pi / 2)
 		local beam = Builder.Part({
 			Name = "Beam",
 			Shape = Enum.PartType.Cylinder,
 			Size = Vector3.new(0.5, 3, 3),
-			CFrame = CFrame.new(padCf.Position + Vector3.new(0, 2, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+			CFrame = pillar,
 			Material = Enum.Material.Neon,
 			Color = rarity.Color,
 			Transparency = 0.3,
 			CanCollide = false,
 			CanQuery = false,
 			CanTouch = false,
+			CastShadow = false,
 			Parent = self.View.LocalFolder,
 		})
 		s.Trove:Add(beam)
-		TweenService:Create(beam, TweenInfo.new(0.6, Enum.EasingStyle.Quint), { Size = Vector3.new(30, 3, 3), CFrame = beam.CFrame + Vector3.new(0, 15, 0), Transparency = 0.6 }):Play()
+		-- opaque neon core: keeps the pillar glowing inside the translucent shell
+		local core = Builder.Part({
+			Name = "BeamCore",
+			Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(0.5, 0.7, 0.7),
+			CFrame = pillar,
+			Material = Enum.Material.Neon,
+			Color = rarity.Color:Lerp(Color3.new(1, 1, 1), 0.5),
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			CastShadow = false,
+			Parent = self.View.LocalFolder,
+		})
+		s.Trove:Add(core)
+		local rise = TweenInfo.new(0.6, Enum.EasingStyle.Quint)
+		s:Tween(beam, rise, { Size = Vector3.new(30, 3, 3), CFrame = pillar + Vector3.new(0, 15, 0), Transparency = 0.6 })
+		s:Tween(core, rise, { Size = Vector3.new(30, 0.7, 0.7), CFrame = pillar + Vector3.new(0, 15, 0) })
 		Effects.GlowBall(padCf.Position + Vector3.new(0, 3, 0), rarity.Color, 10, 0.6)
 		Effects.Burst(padCf.Position + Vector3.new(0, 3, 0), "Sparks", profile.SparkBurst * 2, rarity.Color)
 		Effects.FlashLight(padCf.Position + Vector3.new(0, 4, 0), rarity.Color, 7, 26, 0.9)
-		CameraDirector.Punch(profile.FovPunch)
+		if not Effects.ReduceMotion() then
+			CameraDirector.Punch(profile.FovPunch)
+		end
 		cine:Impact(rarity.Color, 0.5 + rarity.Rank * 0.08)
 		local fan = Effects.LightFan(padCf.Position + Vector3.new(0, 3.5, 0), { rarity.Gradient[1], rarity.Gradient[2], Theme.Colors.Gold }, 10, 11)
 		s.Trove:Add(fan.Stop)
 		Audio.Play("Fanfare")
+		local tag: BillboardGui? = nil
+		local tagLabel: TextLabel? = nil
+		local petOut: number? = nil
 		if reward.Kind == "Pet" and reward.PetId then
 			local petModel = PetModel.Build(reward.PetId)
 			petModel.Parent = self.View.LocalFolder
 			s.Trove:Add(petModel)
+			local scale = petModel:GetScale()
+			local fading = {}
+			for _, d in petModel:GetDescendants() do
+				if d:IsA("BasePart") or d:IsA("Decal") then
+					table.insert(fading, d)
+				end
+			end
 			local start = os.clock()
+			local lastK = 0
 			s.Trove:Connect(RunService.Heartbeat, function()
 				local t = os.clock() - start
+				local k = if petOut then math.min((os.clock() - petOut) / 0.35, 1) else 0
+				if k ~= lastK then
+					-- outro: shrinks and fades instead of blinking out with the show
+					lastK = k
+					petModel:ScaleTo(scale * (1 - 0.6 * k))
+					for _, d in fading do
+						(d :: any).LocalTransparencyModifier = k
+					end
+				end
 				petModel:PivotTo(padCf * CFrame.new(0, 1 + math.min(t, 0.6) * 4, 0) * CFrame.Angles(0, t * 1.4, 0))
 			end)
 		else
-			local tag = UI.new("BillboardGui", { Size = UDim2.fromOffset(260, 70), StudsOffset = Vector3.new(0, 6, 0), AlwaysOnTop = true, Adornee = self.Pad, Parent = self.View.LocalFolder })
+			tag = UI.new("BillboardGui", { Size = UDim2.fromOffset(260, 70), StudsOffset = Vector3.new(0, 6, 0), AlwaysOnTop = true, Adornee = self.Pad, Parent = self.View.LocalFolder })
 			s.Trove:Add(tag)
-			UI.Label({ Text = glyph .. "  " .. text, Size = UDim2.fromScale(1, 1), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Center, FontFace = Theme.Fonts.Title, TextColor3 = rarity.Color, TextStrokeTransparency = 0.3, Parent = tag })
+			tagLabel = UI.Label({ Text = glyph .. "  " .. text, Size = UDim2.fromScale(1, 1), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Center, FontFace = Theme.Fonts.Title, TextColor3 = rarity.Color, TextStrokeTransparency = 0.3, Parent = tag })
 		end
 		show()
-		s:Wait(2.4)
-		-- crate sinks into the pad
-		animate(s, 0.6, function(a)
-			self:_placeCrate(padCf * CFrame.new(0, -a * CRATE_SIZE, 0))
-		end)
+		if not s:Wait(2.4) then
+			return
+		end
+		-- outro: pillar, tag and pet fade out while the crate sinks into the pad
+		fan.Stop()
+		local out = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		s:Tween(beam, out, { Size = Vector3.new(30, 0.2, 0.2), Transparency = 1 })
+		s:Tween(core, out, { Size = Vector3.new(30, 0.05, 0.05), Transparency = 1 })
+		if tag and tagLabel then
+			s:Tween(tagLabel, out, { TextTransparency = 1, TextStrokeTransparency = 1 })
+			s:Tween(tag, out, { StudsOffset = Vector3.new(0, 7.5, 0) })
+		end
+		petOut = os.clock()
+		self:_sinkCrate(crate, s, lid ~= nil)
 	end, function(s)
 		cine:End()
 		if not s.Cancelled then
 			show()
 		end
-		controller.Hud:ReleaseCurrency(result.Currency or "Coins")
-		if self.Crate then
-			self.Crate:Destroy()
+		-- (show() releases the counter it holds once the reward coins land)
+		if pendingRelease ~= currency then
+			hud:ReleaseCurrency(currency)
+		end
+		if rewardCurrency and rewardCurrency ~= currency and rewardCurrency ~= pendingRelease then
+			hud:ReleaseCurrency(rewardCurrency)
+		end
+		if self.Crate == crate then
+			crate:Destroy()
 			self.Crate = nil
 		end
-		self.State = "None"
+		if (self.State :: string) == "Opening" then
+			self.State = "None"
+		end
 		controller:EndShow(seq)
 		if self.Focused then
 			self:_showPanel()
