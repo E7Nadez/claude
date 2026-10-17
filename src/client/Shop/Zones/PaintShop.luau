@@ -24,6 +24,22 @@ local CameraDirector = require(ShopFolder.CameraDirector)
 local PaintShop = {}
 PaintShop.__index = PaintShop
 
+local DURATION = 5 -- seconds on the line
+local RETURN_GLIDE = 1 -- camera back to the line start before the next run
+local BLEND = 0.5 -- camera eases from wherever it is into the tracking shot
+local LINGER = 0.7 -- the last mist dies out before a run's emitters go
+
+local function lookKey(vacuumId: string?, skin: string?, trail: string?): string
+	return string.format("%s|%s|%s", vacuumId or "", skin or "", trail or "")
+end
+
+-- Share of the line covered (0..1) over the run time (0..1): eases off the start,
+-- slows to about belt speed through the spray booth at the middle of the line
+-- and eases into the end (speed ~ 0.3 (1 - cos 2πa) + 0.7 (1 - cos 4πa)).
+local function travel(alpha: number): number
+	return alpha - 0.3 * math.sin(2 * math.pi * alpha) / (2 * math.pi) - 0.7 * math.sin(4 * math.pi * alpha) / (4 * math.pi)
+end
+
 function PaintShop.new(view)
 	local self = setmetatable({}, PaintShop)
 	self.View = view
@@ -49,6 +65,7 @@ function PaintShop.new(view)
 	self.Trove:Connect(view.Controller.ClientData.Changed, function()
 		if self.Active and not self.Running then
 			self:_showPanel()
+			self:_refreshDisplay()
 		end
 	end)
 	return self
@@ -60,79 +77,243 @@ function PaintShop:_lineEnds(): (Vector3, Vector3)
 	return self.View:ToWorld(Vector3.new(config.LineStartX + 3, y, config.LineZ)), self.View:ToWorld(Vector3.new(config.LineEndX - 3, y, config.LineZ))
 end
 
-function PaintShop:_spawnDisplay(skinId: string?)
+-- Paint-line camera for a vehicle at `position`: it slides along the line (in
+-- the factory's own axes, so rotated factories track too) half as far as the
+-- vehicle and looks at it.
+function PaintShop:_shot(position: Vector3): CFrame
+	local startPos, endPos = self:_lineEnds()
+	local axis = (endPos - startPos).Unit
+	local camera = self.View:ToWorld(Factory.PaintShop.Camera)
+	return CFrame.lookAt(camera + axis * ((position - camera):Dot(axis) * 0.5), position + Vector3.new(0, 1.5, 0))
+end
+
+function PaintShop:_spawnDisplay(skinId: string?, trailId: string?, pivot: CFrame?)
 	if self.Display then
+		self.ModeTrove:Remove(self.Display)
 		self.Display:Destroy()
 	end
 	local controller = self.View.Controller
 	local vacuumId = controller.ClientData:Equipped()
 	local model = VacuumModel.Build(vacuumId, { Skin = skinId })
+	local startPos, endPos = self:_lineEnds()
+	-- (placed before the trail goes on, so it draws no streak from the origin)
+	model:PivotTo(pivot or CFrame.lookAt(startPos, endPos) * CFrame.Angles(0, math.pi / 2, 0))
+	VacuumModel.AttachTrail(model, trailId)
 	model.Parent = self.View.LocalFolder
 	self.Display = model
+	self.DisplayVacuum = vacuumId
+	self.DisplaySkin = skinId
+	self.DisplayTrail = trailId
 	self.ModeTrove:Add(model)
-	local startPos, endPos = self:_lineEnds()
-	model:PivotTo(CFrame.lookAt(startPos, endPos) * CFrame.Angles(0, math.pi / 2, 0))
 	return model
 end
 
+-- Equip / Unequip (any change of the equipped look): the vehicle on the line
+-- takes it on where it stands, under a puff of glitter. Other data changes and a
+-- previewed paint job still on the line are left alone.
+function PaintShop:_refreshDisplay()
+	local controller = self.View.Controller
+	local data = controller.ClientData:Get()
+	local model = self.Display
+	if not data or not model or not model.Parent or self.Running or self.Buying then
+		return
+	end
+	local vacuumId = controller.ClientData:Equipped()
+	local skin, trail = data.Cosmetics.Skin, data.Cosmetics.Trail
+	local key = lookKey(vacuumId, skin, trail)
+	if key == self.Seen then
+		return
+	end
+	self.Seen = key
+	if key == lookKey(self.DisplayVacuum, self.DisplaySkin, self.DisplayTrail) then
+		return
+	end
+	local pivot = model:GetPivot()
+	if self.DisplayVacuum ~= vacuumId then
+		self:_spawnDisplay(skin, trail, pivot)
+	else
+		if self.DisplaySkin ~= skin then
+			VacuumModel.ApplySkin(model, skin)
+			self.DisplaySkin = skin
+		end
+		if self.DisplayTrail ~= trail then
+			VacuumModel.AttachTrail(model, trail)
+			self.DisplayTrail = trail
+		end
+	end
+	local look = Cosmetics.Get(skin)
+	Effects.Burst(pivot.Position + Vector3.new(0, 1.5, 0), "Glitter", 24, look and (look.Glow or look.Body) or Color3.new(1, 1, 1))
+end
+
+-- Preview and the carousel grey out while a run plays (they would do nothing).
+function PaintShop:_lockControls(locked: boolean)
+	local hud = self.View.Controller.FactoryHud
+	local preview = hud:GetButton("Preview")
+	if preview then
+		preview:SetEnabled(not locked)
+	end
+	if hud.PrevButton then
+		hud.PrevButton:SetEnabled(not locked)
+	end
+	if hud.NextButton then
+		hud.NextButton:SetEnabled(not locked)
+	end
+end
+
 -- Drives the model through the booth; parts recolor as they pass the spray plane.
-function PaintShop:_run(cosmetic: Cosmetics.Cosmetic)
-	if self.Running then
+-- `from` is the look the vehicle starts with (default: the equipped one).
+function PaintShop:_run(cosmetic: Cosmetics.Cosmetic, from: { Skin: string?, Trail: string? }?)
+	if self.Running or not self.Active then
 		return
 	end
 	self.Running = true
 	local controller = self.View.Controller
 	local current = controller.ClientData:Get()
-	local currentSkin = current and current.Cosmetics.Skin
-	local model = self:_spawnDisplay(currentSkin)
+	local fromSkin = if from then from.Skin else current and current.Cosmetics.Skin
+	local fromTrail = if from then from.Trail else current and current.Cosmetics.Trail
+	local runTrove = self.ModeTrove:Extend()
+	local startPos, endPos = self:_lineEnds()
+
+	-- After a run the painted vehicle waits at the line end: the next one is set
+	-- on the line start (out of shot) while the camera glides back, and the
+	-- painted one goes once it is out of shot. A vehicle already waiting at the
+	-- start is reused, so the run begins without a pop.
+	local old: Model? = nil
+	local startDelay = 0
+	if self.Parked or not (self.Display and self.Display.Parent) then
+		old = self.Display
+		self.Display = nil
+		self:_spawnDisplay(fromSkin, fromTrail)
+		if self.Parked then
+			local shot = self:_shot(startPos)
+			if Effects.ReduceMotion() then
+				CameraDirector.Snap(shot, 62)
+			else
+				CameraDirector.GlideTo(shot, RETURN_GLIDE, Enum.EasingStyle.Sine, 62)
+				startDelay = RETURN_GLIDE
+			end
+		end
+	else
+		if self.DisplaySkin ~= fromSkin then
+			VacuumModel.ApplySkin(self.Display, fromSkin)
+			self.DisplaySkin = fromSkin
+		end
+		if self.DisplayTrail ~= fromTrail then
+			VacuumModel.AttachTrail(self.Display, fromTrail)
+			self.DisplayTrail = fromTrail
+		end
+	end
+	self.Parked = false
+	local model = self.Display :: Model
 	local vacuum = Vacuums.Get(model:GetAttribute("VacuumId"))
 	local targetLook = if vacuum and cosmetic.Slot == "Skin" then VacuumModel.SkinnedLook(vacuum.Look, cosmetic.Id) else nil
-	local startPos, endPos = self:_lineEnds()
 	local rotation = CFrame.lookAt(startPos, endPos).Rotation * CFrame.Angles(0, math.pi / 2, 0)
 	local boothX = self.View:ToWorld(Vector3.new(Factory.PaintShop.BoothX, 0, Factory.PaintShop.LineZ))
 	local axis = (endPos - startPos).Unit
 	local boothAlong = (boothX - startPos):Dot(axis)
 	local painted = {}
-	local trail = nil
+	local trailDone = false
 	local emitters = {}
 	local color = if cosmetic.Slot == "Skin" then (cosmetic.Glow or cosmetic.Body or Color3.new(1, 1, 1)) else (cosmetic.Colors and cosmetic.Colors[1] or Color3.new(1, 1, 1))
+	-- the mist is the paint going on: body colour, thinning towards the glow
+	local mist = if cosmetic.Slot == "Skin" then ColorSequence.new(cosmetic.Body or color, cosmetic.Glow or cosmetic.Body or color) else ColorSequence.new(color)
 	for _, nozzle in self.Nozzles do
 		local attachment = Instance.new("Attachment")
 		local aim = nozzle:GetAttribute("Aim")
 		attachment.WorldCFrame = CFrame.lookAt(nozzle.Position, if typeof(aim) == "Vector3" then aim else nozzle.Position - Vector3.yAxis) * CFrame.Angles(-math.pi / 2, 0, 0)
 		attachment.Parent = workspace.Terrain
 		local emitter = Effects.Emitter(attachment, "Paint", color, 60)
+		emitter.Color = mist
 		table.insert(emitters, emitter)
-		self.ModeTrove:Add(attachment)
+		runTrove:Add(attachment)
 	end
 	local spray = Audio.Loop("Spray", self.Nozzles[1])
+	local sprayVolume = 0
 	if spray then
-		self.ModeTrove:Add(spray)
+		runTrove:Add(spray)
+		sprayVolume = spray.Volume
 		spray.Volume = 0
 	end
-	local camera = self.View:ToWorld(Factory.PaintShop.Camera)
-	local duration = 4.2
-	local start = os.clock()
+
+	-- The line's slats run with the vehicle meanwhile (BeltSpeed is what the
+	-- belt animation reads); Preview and the carousel are locked.
+	local line = self.Line
+	local idleSpeed = line and line:GetAttribute("BeltSpeed")
+	local function driveBelt(speed: number?)
+		if line and line.Parent and typeof(idleSpeed) == "number" then
+			line:SetAttribute("BeltSpeed", if speed then math.max(speed, idleSpeed) else idleSpeed)
+		end
+	end
+	local locked = true
+	self:_lockControls(true)
+	local function release()
+		if locked then
+			locked = false
+			self:_lockControls(false)
+			driveBelt(nil)
+		end
+	end
+	runTrove:Add(release)
+
+	local camera = workspace.CurrentCamera
+	local begin = os.clock() + startDelay
 	local length = (endPos - startPos).Magnitude
+	local blendFrom: CFrame? = nil
+	local fovFrom = 62
+	local lastAlong = 0
 	local finished = false
-	local connection
-	connection = RunService.Heartbeat:Connect(function()
-		if not model.Parent then
-			connection:Disconnect()
+	local function stop()
+		self.ModeTrove:Remove(runTrove)
+		runTrove:Clean()
+	end
+	runTrove:Connect(RunService.Heartbeat, function(dt: number)
+		if not self.Active or not model.Parent then
+			-- (mode left or vehicle replaced: nothing of this run stays behind)
+			if not finished then
+				self.Running = false
+			end
+			stop()
 			return
 		end
-		local alpha = math.clamp((os.clock() - start) / duration, 0, 1)
-		local along = alpha * length
+		local t = os.clock() - begin
+		if t < 0 then
+			return
+		end
+		if old then
+			self.ModeTrove:Remove(old)
+			old:Destroy()
+			old = nil
+		end
+		if finished then
+			if spray then
+				spray.Volume *= math.max(1 - dt * 10, 0)
+			end
+			if t >= DURATION + LINGER then
+				stop()
+			end
+			return
+		end
+		local alpha = math.clamp(t / DURATION, 0, 1)
+		local along = travel(alpha) * length
 		local cf = CFrame.new(startPos + axis * along) * rotation
 		model:PivotTo(cf)
-		CameraDirector.Snap(CFrame.lookAt(camera:Lerp(Vector3.new(cf.Position.X, camera.Y, camera.Z), 0.5), cf.Position + Vector3.new(0, 1.5, 0)))
+		-- (eases out of wherever the camera is, e.g. a running Enter glide)
+		if not blendFrom then
+			blendFrom = camera.CFrame
+			fovFrom = camera.FieldOfView
+		end
+		local blend = TweenService:GetValue(math.clamp(t / BLEND, 0, 1), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+		CameraDirector.Snap((blendFrom :: CFrame):Lerp(self:_shot(cf.Position), blend), fovFrom + (62 - fovFrom) * blend)
 		local near = math.abs(along - boothAlong) < 6
 		for _, emitter in emitters do
 			emitter.Enabled = near
 		end
 		if spray then
-			spray.Volume = if near then 0.25 else 0
+			-- (fades with the spray instead of cutting on and off)
+			spray.Volume += ((if near then sprayVolume else 0) - spray.Volume) * math.min(dt * 12, 1)
 		end
+		driveBelt((along - lastAlong) / math.max(dt, 1 / 240))
+		lastAlong = along
 		if targetLook then
 			for _, part in model:GetDescendants() do
 				if part:IsA("BasePart") and not painted[part] and part:GetAttribute("Role") then
@@ -144,25 +325,33 @@ function PaintShop:_run(cosmetic: Cosmetics.Cosmetic)
 					end
 				end
 			end
-		elseif cosmetic.Slot == "Trail" and not trail and along >= boothAlong then
-			trail = VacuumModel.AttachTrail(model, cosmetic.Id)
+		elseif cosmetic.Slot == "Trail" and not trailDone and along >= boothAlong then
+			trailDone = true
+			VacuumModel.AttachTrail(model, cosmetic.Id)
 			Effects.Burst(cf.Position + Vector3.new(0, 2, 0), "Glow", 16, color)
 		end
-		if alpha >= 1 and not finished then
+		if alpha >= 1 then
 			finished = true
-			connection:Disconnect()
 			for _, emitter in emitters do
 				emitter.Enabled = false
 			end
 			Effects.Burst(cf.Position + Vector3.new(0, 2, 0), "Sparks", 30, color)
 			Audio.Play("Success")
 			self.Running = false
-			if self.Active then
-				self:_showPanel()
+			-- the painted vehicle waits at the line end (in shot) until the next run
+			if self.Display == model then
+				self.Parked = true
+				if targetLook then
+					self.DisplaySkin = cosmetic.Id
+				elseif trailDone then
+					self.DisplayTrail = cosmetic.Id
+				end
 			end
+			release()
+			self:_showPanel()
+			self:_refreshDisplay()
 		end
 	end)
-	self.ModeTrove:Add(connection)
 end
 
 function PaintShop:_selected(): Cosmetics.Cosmetic
@@ -228,6 +417,10 @@ function PaintShop:_buy(cosmetic: Cosmetics.Cosmetic)
 	if not item or self.Buying then
 		return
 	end
+	-- The paint pass starts from the look before the purchase (the server equips
+	-- the new cosmetic, and its data sync can arrive before the reply).
+	local data = controller.ClientData:Get()
+	local from = { Skin = data and data.Cosmetics.Skin, Trail = data and data.Cosmetics.Trail }
 	self.Buying = true
 	local result = controller:RequestPurchase(item)
 	self.Buying = false
@@ -236,11 +429,17 @@ function PaintShop:_buy(cosmetic: Cosmetics.Cosmetic)
 		return
 	end
 	local booth = self.View:ToWorld(Vector3.new(Factory.PaintShop.BoothX, 10, Factory.PaintShop.LineZ))
-	controller:CoinFlight(result.Currency or "Coins", result.Price or 0, booth)
+	-- (the coins fly to the screen centre once the paint shop was left meanwhile)
+	controller:CoinFlight(result.Currency or "Coins", result.Price or 0, if self.Active then booth else nil)
 	local rarity = Rarities.Get(cosmetic.Rarity)
 	Effects.Confetti(booth, 60, { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) })
 	controller.Hud:Banner({ Title = cosmetic.Name, Subtitle = "Equipped  ·  " .. rarity.Name, Rarity = cosmetic.Rarity, Style = "Small" })
-	self:_run(cosmetic)
+	-- No paint pass once the mode was left during the round trip (the camera is
+	-- not ours any more); a preview of this cosmetic still running already shows
+	-- it going on.
+	if self.Active and not self.Running then
+		self:_run(cosmetic, from)
+	end
 end
 
 function PaintShop:Enter()
@@ -248,6 +447,7 @@ function PaintShop:Enter()
 	if not controller:EnterMode("PaintShop", function()
 		self.Active = false
 		self.Running = false
+		self.Parked = false
 		self.ModeTrove:Clean()
 		self.Display = nil
 		controller.FactoryHud:HidePanel()
@@ -257,11 +457,15 @@ function PaintShop:Enter()
 		return
 	end
 	self.Active = true
+	self.Parked = false
 	local data = controller.ClientData:Get()
-	self:_spawnDisplay(data and data.Cosmetics.Skin)
-	local startPos, endPos = self:_lineEnds()
-	local camera = self.View:ToWorld(Factory.PaintShop.Camera)
-	CameraDirector.GlideTo(CFrame.lookAt(camera, (startPos + endPos) / 2 + Vector3.new(0, 1.5, 0)), 0.8, Enum.EasingStyle.Quint, 62)
+	local skin = data and data.Cosmetics.Skin
+	local trail = data and data.Cosmetics.Trail
+	self.Seen = lookKey(controller.ClientData:Equipped(), skin, trail)
+	self:_spawnDisplay(skin, trail)
+	-- Frames the vehicle waiting at the line start: the shot a run starts from.
+	local startPos = self:_lineEnds()
+	CameraDirector.GlideTo(self:_shot(startPos), 0.8, Enum.EasingStyle.Quint, 62)
 	controller.FactoryHud:ShowCarousel(function()
 		if not self.Running then
 			self.Index = (self.Index - 2) % #self.List + 1

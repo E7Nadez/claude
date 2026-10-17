@@ -62,6 +62,10 @@ function Effects.Layer(): ScreenGui
 	gui.Name = "ShopEffects"
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
+	-- Offsets in this layer are raw viewport pixels (what ToScreen returns),
+	-- also on devices with notches / cutouts. Decoration only, nothing to tap.
+	gui.ScreenInsets = Enum.ScreenInsets.None
+	gui.ClipToDeviceSafeArea = false
 	gui.DisplayOrder = Theme.Layers.Effects
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
@@ -202,6 +206,10 @@ function Presets.Rise(e: ParticleEmitter, color: Color3)
 	e.Drag = 0.5
 end
 
+-- Negative speed: particles travel against EmissionDirection. Emit from a sheet
+-- or disc in front of the intake (emission side facing away from it), or
+-- override Speed with a positive range aimed at the mouth. On an Attachment at
+-- the mouth itself it would blow particles out backwards.
 function Presets.Suction(e: ParticleEmitter, color: Color3)
 	e.Texture = TEXTURES.Spark
 	e.Color = ColorSequence.new(color)
@@ -258,34 +266,65 @@ function Effects.GlowBall(position: Vector3, color: Color3, size: number, durati
 	Debris:AddItem(ball, (duration or 0.5) + 0.1)
 end
 
--- Flat expanding ring on the floor.
+-- Flat expanding ring on the floor: a glowing outline (stroke on a round
+-- frame) on an invisible plate, with a faint flash filling it at the start.
 function Effects.Shockwave(position: Vector3, color: Color3, radius: number, duration: number?)
-	local disc = Builder.Part({
+	local time = duration or 0.6
+	-- 1 stud margin around the final ring, so its outer stroke is never cut off
+	local span = radius * 2 + 2
+	local pixels = math.min(16, 1024 / span)
+	local plate = Builder.Part({
 		Name = "FxShock",
-		Shape = Enum.PartType.Cylinder,
-		Size = Vector3.new(0.2, 1, 1),
-		CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.pi / 2),
-		Material = Enum.Material.Neon,
-		Color = color,
-		Transparency = 0.2,
+		Size = Vector3.new(span, 0.2, span),
+		CFrame = CFrame.new(position),
+		Transparency = 1,
 		CanCollide = false,
 		CanQuery = false,
 		CanTouch = false,
 		CastShadow = false,
 		Parent = workspace,
 	})
-	TweenService:Create(disc, TweenInfo.new(duration or 0.6, Enum.EasingStyle.Quart), { Size = Vector3.new(0.2, radius * 2, radius * 2), Transparency = 1 }):Play()
-	Debris:AddItem(disc, (duration or 0.6) + 0.1)
+	local surface = UI.new("SurfaceGui", {
+		Face = Enum.NormalId.Top,
+		SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud,
+		PixelsPerStud = pixels,
+		LightInfluence = 0,
+		Brightness = 2,
+		Parent = plate,
+	})
+	local ring = UI.new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.04, 0.04),
+		BackgroundColor3 = color,
+		BackgroundTransparency = 0.5,
+		Parent = surface,
+	}, { UI.Corner(UDim.new(0.5, 0)) })
+	local stroke = UI.Stroke(color, 0, 0.7 * pixels)
+	stroke.Parent = ring
+	local final = radius * 2 / span
+	TweenService:Create(ring, TweenInfo.new(time, Enum.EasingStyle.Quart), { Size = UDim2.fromScale(final, final) }):Play()
+	TweenService:Create(ring, TweenInfo.new(time * 0.35, Enum.EasingStyle.Quad), { BackgroundTransparency = 1 }):Play()
+	TweenService:Create(stroke, TweenInfo.new(time, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { Transparency = 1, Thickness = 0.12 * pixels }):Play()
+	Debris:AddItem(plate, time + 0.1)
 end
 
--- Physical confetti made of small parts, simulated locally.
+-- Physical confetti made of small parts, simulated locally: paper-like drag and
+-- flutter, settles flat on the floor below it and fades out at the end.
 local confettiPool: { BasePart } = {}
-local activeConfetti: { { Part: BasePart, Velocity: Vector3, Spin: Vector3, Life: number, Age: number, Rot: CFrame, Pos: Vector3 } } = {}
+local activeConfetti: { { Part: BasePart, Velocity: Vector3, Spin: Vector3, Life: number, Age: number, Rot: CFrame, Pos: Vector3, Phase: number, Ground: number?, Landed: boolean } } = {}
 local confettiConnection: RBXScriptConnection? = nil
+local CONFETTI_FADE = 0.5
+-- ground probes per frame (one per piece, when it starts to fall)
+local CONFETTI_PROBES = 30
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.RespectCanCollide = true
 
 local function getConfettiPart(): BasePart
 	local part = table.remove(confettiPool)
 	if part then
+		part.Transparency = 0
 		return part
 	end
 	return Builder.Part({
@@ -301,6 +340,7 @@ end
 
 local function stepConfetti(dt: number)
 	local parts, cframes = {}, {}
+	local probes = 0
 	for i = #activeConfetti, 1, -1 do
 		local c = activeConfetti[i]
 		c.Age += dt
@@ -309,11 +349,32 @@ local function stepConfetti(dt: number)
 			table.insert(confettiPool, c.Part)
 			table.remove(activeConfetti, i)
 		else
-			c.Velocity = c.Velocity * (1 - math.min(dt * 1.6, 0.5)) + Vector3.new(0, -18 * dt, 0)
-			c.Pos += c.Velocity * dt + Vector3.new(math.sin(c.Age * 6 + i) * dt * 1.5, 0, 0)
-			c.Rot = c.Rot * CFrame.Angles(c.Spin.X * dt, c.Spin.Y * dt, c.Spin.Z * dt)
-			table.insert(parts, c.Part)
-			table.insert(cframes, CFrame.new(c.Pos) * c.Rot)
+			if c.Age > c.Life - CONFETTI_FADE then
+				c.Part.Transparency = (c.Age - (c.Life - CONFETTI_FADE)) / CONFETTI_FADE
+			end
+			if not c.Landed then
+				-- terminal speed ~5 studs/s: drifts down like paper, not gravel
+				c.Velocity = c.Velocity * (1 - math.min(dt * 2.4, 0.5)) + Vector3.new(0, -12 * dt, 0)
+				local flutter = Vector3.new(math.sin(c.Age * 5 + c.Phase), 0, math.cos(c.Age * 4 + c.Phase)) * 1.6
+				c.Pos += (c.Velocity + flutter) * dt
+				c.Rot = c.Rot * CFrame.Angles(c.Spin.X * dt, c.Spin.Y * dt, c.Spin.Z * dt)
+				-- probed once the fall has picked up, when little sideways drift is left
+				if c.Ground == nil and c.Velocity.Y < -3 and probes < CONFETTI_PROBES then
+					probes += 1
+					local hit = workspace:Raycast(c.Pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -60, 0), groundParams)
+					c.Ground = if hit then hit.Position.Y + 0.03 else -math.huge
+				end
+				local ground = c.Ground
+				if ground and c.Pos.Y <= ground then
+					-- settle flat on the floor instead of sinking through it
+					c.Landed = true
+					c.Pos = Vector3.new(c.Pos.X, ground, c.Pos.Z)
+					local _, yaw = c.Rot:ToEulerAnglesYXZ()
+					c.Rot = CFrame.Angles(0, yaw, 0)
+				end
+				table.insert(parts, c.Part)
+				table.insert(cframes, CFrame.new(c.Pos) * c.Rot)
+			end
 		end
 	end
 	if #parts > 0 then
@@ -330,19 +391,34 @@ function Effects.Confetti(position: Vector3, count: number, colors: { Color3 }?,
 	local n = math.min(Effects.Count(count, "Confetti"), 300 - #activeConfetti)
 	local rng = Random.new()
 	local strength = power or 1
+	local spin = if reduceMotion then 3 else 8
+	-- characters are not floors (the local one is often right under the burst)
+	local characters = {}
+	for _, player in Players:GetPlayers() do
+		if player.Character then
+			table.insert(characters, player.Character)
+		end
+	end
+	groundParams.FilterDescendantsInstances = characters
 	for _ = 1, n do
 		local part = getConfettiPart()
+		local rot = CFrame.Angles(rng:NextNumber(0, 6), rng:NextNumber(0, 6), 0)
 		part.Color = palette[rng:NextInteger(1, #palette)]
+		-- placed before it shows: a pooled piece still sits where it last landed
+		part.CFrame = CFrame.new(position) * rot
 		part.Parent = workspace
 		local dir = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(0.8, 2.2), rng:NextNumber(-1, 1)).Unit
 		table.insert(activeConfetti, {
 			Part = part,
 			Velocity = dir * rng:NextNumber(14, 30) * strength,
-			Spin = Vector3.new(rng:NextNumber(-8, 8), rng:NextNumber(-8, 8), rng:NextNumber(-8, 8)),
-			Life = rng:NextNumber(2.2, 3.4),
+			Spin = Vector3.new(rng:NextNumber(-spin, spin), rng:NextNumber(-spin, spin), rng:NextNumber(-spin, spin)),
+			Life = rng:NextNumber(2.6, 3.8),
 			Age = 0,
-			Rot = CFrame.Angles(rng:NextNumber(0, 6), rng:NextNumber(0, 6), 0),
+			Rot = rot,
 			Pos = position,
+			Phase = rng:NextNumber(0, math.pi * 2),
+			Ground = nil,
+			Landed = false,
 		})
 	end
 	if not confettiConnection then
@@ -352,37 +428,75 @@ end
 
 -- UI effects -------------------------------------------------------------------
 
--- Coins fly from a screen point to another along curved paths.
-function Effects.CoinFlight(from: Vector2, to: Vector2, count: number, glyph: string?, onArrive: ((number) -> ())?)
+-- A coin flight end: a point on the effects layer, a GUI object or a world
+-- position. The last two are tracked while the coins fly (the HUD column
+-- slides under the letterbox as a show starts, the camera moves).
+export type CoinPoint = Vector2 | GuiObject | Vector3
+
+local function coinPoint(target: CoinPoint, last: Vector2?): Vector2
+	if typeof(target) == "Vector2" then
+		return target :: Vector2
+	elseif typeof(target) == "Vector3" then
+		return (Effects.ToScreen(target :: Vector3))
+	end
+	local object = target :: GuiObject
+	if last and not object.Parent then
+		return last
+	end
+	return Effects.GuiCenter(object)
+end
+
+-- Coins fly from a screen point to another along curved paths. Returns the
+-- duration and a cancel function (skip / cancel: no more coins, no onArrive).
+function Effects.CoinFlight(from: CoinPoint, to: CoinPoint, count: number, glyph: string?, onArrive: ((number) -> ())?): (number, () -> ())
 	local gui = Effects.Layer()
 	local n = Effects.Count(count)
 	local rng = Random.new()
+	local calm = reduceMotion
+	local cancelled = false
+	local flying: { [Instance]: Tween } = {}
 	for i = 1, n do
 		task.delay((i - 1) * 0.045, function()
+			if cancelled then
+				return
+			end
+			local start = coinPoint(from)
+			local goal = coinPoint(to)
 			local coin = UI.Label({
 				Text = glyph or "🪙",
-				Size = UDim2.fromOffset(30, 30),
+				Size = UDim2.fromOffset(0, 0),
 				AnchorPoint = Vector2.new(0.5, 0.5),
-				Position = UDim2.fromOffset(from.X, from.Y),
+				Position = UDim2.fromOffset(start.X, start.Y),
 				TextXAlignment = Enum.TextXAlignment.Center,
 				TextScaled = true,
 				ZIndex = 10,
 				Parent = gui,
 			})
-			local control = (from + to) / 2 + Vector2.new(rng:NextNumber(-140, 140), rng:NextNumber(-180, -60))
+			local bend = Vector2.new(rng:NextNumber(-140, 140), rng:NextNumber(-180, -60))
 			local value = Instance.new("NumberValue")
+			-- goes with the coin when a cancel destroys it
+			value.Parent = coin
 			value.Changed:Connect(function(t)
-				local a = from:Lerp(control, t)
-				local b = control:Lerp(to, t)
+				goal = coinPoint(to, goal)
+				local control = (start + goal) / 2 + bend
+				local a = start:Lerp(control, t)
+				local b = control:Lerp(goal, t)
 				local p = a:Lerp(b, t)
 				coin.Position = UDim2.fromOffset(p.X, p.Y)
-				coin.Rotation = t * 540
-				coin.Size = UDim2.fromOffset(30 - t * 12, 30 - t * 12)
+				coin.Rotation = if calm then 0 else t * 540
+				-- grows out of the source instead of popping in at full size
+				local size = (30 - t * 12) * math.min(t / 0.1, 1)
+				coin.Size = UDim2.fromOffset(size, size)
 			end)
 			local tween = TweenService:Create(value, TweenInfo.new(0.55, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { Value = 1 })
+			flying[coin] = tween
 			tween.Completed:Connect(function()
+				flying[coin] = nil
 				coin:Destroy()
 				value:Destroy()
+				if cancelled then
+					return
+				end
 				Audio.Play("Coin", { Speed = 1 + i * 0.03 })
 				if onArrive then
 					onArrive(i)
@@ -391,19 +505,37 @@ function Effects.CoinFlight(from: Vector2, to: Vector2, count: number, glyph: st
 			tween:Play()
 		end)
 	end
-	return n * 0.045 + 0.55
+	return n * 0.045 + 0.55, function()
+		if cancelled then
+			return
+		end
+		cancelled = true
+		for coin, tween in flying do
+			flying[coin] = nil
+			tween:Cancel()
+			coin:Destroy()
+		end
+	end
 end
 
 function Effects.ScreenFlash(color: Color3, strength: number?, duration: number?)
 	local gui = Effects.Layer()
+	local amount = strength or 0.5
+	local time = duration or 0.5
+	if reduceMotion then
+		-- a soft glow instead of a flash; capped, not scaled, because some
+		-- callers already tone it down for Reduce Motion themselves
+		amount = math.min(amount, 0.2)
+		time = math.max(time, 0.8)
+	end
 	local flash = UI.new("Frame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = color,
-		BackgroundTransparency = 1 - (strength or 0.5),
+		BackgroundTransparency = 1 - amount,
 		ZIndex = 1,
 		Parent = gui,
 	})
-	local tween = TweenService:Create(flash, TweenInfo.new(duration or 0.5), { BackgroundTransparency = 1 })
+	local tween = TweenService:Create(flash, TweenInfo.new(time), { BackgroundTransparency = 1 })
 	tween.Completed:Connect(function()
 		flash:Destroy()
 	end)
@@ -415,6 +547,7 @@ function Effects.UIConfetti(count: number, colors: { Color3 }?)
 	local gui = Effects.Layer()
 	local palette = colors or { Theme.Colors.Accent, Theme.Colors.AccentAlt, Theme.Colors.Gold, Theme.Colors.Success }
 	local rng = Random.new()
+	local turn = if reduceMotion then 90 else 540
 	for _ = 1, Effects.Count(count, "Confetti") do
 		local piece = UI.new("Frame", {
 			Size = UDim2.fromOffset(rng:NextInteger(6, 12), rng:NextInteger(10, 18)),
@@ -427,7 +560,7 @@ function Effects.UIConfetti(count: number, colors: { Color3 }?)
 		local duration = rng:NextNumber(1.4, 2.4)
 		local tween = TweenService:Create(piece, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
 			Position = UDim2.new(piece.Position.X.Scale + rng:NextNumber(-0.15, 0.15), 0, 1.05, 0),
-			Rotation = piece.Rotation + rng:NextNumber(-540, 540),
+			Rotation = piece.Rotation + rng:NextNumber(-turn, turn),
 			BackgroundTransparency = 0.3,
 		})
 		tween.Completed:Connect(function()
@@ -475,7 +608,8 @@ function Effects.SkyTint(color: Color3, fadeIn: number?): () -> ()
 	end
 end
 
--- Sweeping colored spotlights around a point. Returns a stop function.
+-- Sweeping colored spotlights around a point. They fade in, and the returned
+-- stop function fades them out before removing them.
 function Effects.LightShow(center: Vector3, count: number, colors: { Color3 }, height: number?): () -> ()
 	local n = math.max(1, if lowGraphics then math.floor(count * Sequences.LowGraphics.LightCount) else count)
 	local folder = Instance.new("Folder")
@@ -491,6 +625,7 @@ function Effects.LightShow(center: Vector3, count: number, colors: { Color3 }, h
 			CFrame = CFrame.lookAt(pos, center),
 			Material = Enum.Material.Neon,
 			Color = colors[(i - 1) % #colors + 1],
+			Transparency = 1,
 			CanCollide = false,
 			CanQuery = false,
 			CanTouch = false,
@@ -501,7 +636,7 @@ function Effects.LightShow(center: Vector3, count: number, colors: { Color3 }, h
 		light.Face = Enum.NormalId.Front
 		light.Angle = 28
 		light.Range = 60
-		light.Brightness = 6
+		light.Brightness = 0
 		light.Color = head.Color
 		light.Shadows = false
 		light.Parent = head
@@ -516,33 +651,68 @@ function Effects.LightShow(center: Vector3, count: number, colors: { Color3 }, h
 		beam.Color = ColorSequence.new(head.Color)
 		beam.LightEmission = 1
 		beam.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.55), NumberSequenceKeypoint.new(1, 1) })
-		beam.Width0 = 0.6
-		beam.Width1 = 6
+		beam.Width0 = 0
+		beam.Width1 = 0
 		beam.FaceCamera = true
 		beam.Parent = head
-		table.insert(rigs, { Head = head, Base = pos, Target = beamB, Phase = angle })
+		table.insert(rigs, { Head = head, Light = light, Beam = beam, Base = pos, Target = beamB, Phase = angle })
 	end
 	local start = os.clock()
-	local connection = RunService.Heartbeat:Connect(function()
-		local t = os.clock() - start
+	-- Reduce Motion: a slow drift instead of a sweep
+	local speed = if reduceMotion then 0.4 else 1
+	local fade, shown = 0, -1
+	local stopping = false
+	local connection = RunService.Heartbeat:Connect(function(dt)
+		fade = if stopping then math.max(fade - dt / 0.5, 0) else math.min(fade + dt / 0.4, 1)
+		local t = (os.clock() - start) * speed
 		for _, rig in rigs do
 			local target = center + Vector3.new(math.sin(t * 1.7 + rig.Phase) * 9, 0, math.cos(t * 1.3 + rig.Phase * 2) * 9)
 			rig.Head.CFrame = CFrame.lookAt(rig.Base, target)
 			rig.Target.WorldPosition = target
+			if fade ~= shown then
+				rig.Head.Transparency = 1 - fade
+				rig.Light.Brightness = 6 * fade
+				rig.Beam.Width0 = 0.6 * fade
+				rig.Beam.Width1 = 6 * fade
+			end
 		end
+		shown = fade
 	end)
+	local stopped = false
 	return function()
-		connection:Disconnect()
-		for _, rig in rigs do
-			rig.Target:Destroy()
+		if stopped then
+			return
 		end
-		folder:Destroy()
+		stopped = true
+		stopping = true
+		task.delay(0.55, function()
+			connection:Disconnect()
+			for _, rig in rigs do
+				rig.Target:Destroy()
+			end
+			folder:Destroy()
+		end)
 	end
 end
 
--- Factory quake: dust from the ceiling, flickering lamps, rumble.
+-- Factory quake: dust from the ceiling, flickering lamps, rumble. Ends by itself
+-- after `duration`; the returned stop function ends it early (skip / cancel).
 function Effects.Quake(model: Model, center: Vector3, duration: number): () -> ()
-	Audio.PlayAt("Rumble", center)
+	local calm = reduceMotion
+	-- Owned rather than fire-and-forget, so it fades out with the quake (also on
+	-- a skip) instead of rumbling on or being cut off. Plays once.
+	local rumbleHolder = Instance.new("Attachment")
+	rumbleHolder.WorldPosition = center
+	rumbleHolder.Parent = workspace.Terrain
+	local rumble = Audio.Loop("Rumble", rumbleHolder)
+	if rumble then
+		rumble.Looped = false
+		rumble.RollOffMinDistance = 10
+		rumble.RollOffMaxDistance = 140
+		rumble.Ended:Once(function()
+			rumbleHolder:Destroy()
+		end)
+	end
 	local stops = {}
 	local dustCount = if lowGraphics then 2 else 6
 	local rng = Random.new()
@@ -562,26 +732,13 @@ function Effects.Quake(model: Model, center: Vector3, duration: number): () -> (
 		end
 	end
 	local running = true
-	task.spawn(function()
-		local endAt = os.clock() + duration
-		while running and os.clock() < endAt do
-			for _, lamp in lamps do
-				local on = rng:NextNumber() > 0.35
-				lamp.Part.Transparency = if on then lamp.Transparency else 0.8
-				if lamp.Light then
-					lamp.Light.Brightness = if on then lamp.Brightness else 0.1
-				end
-			end
-			task.wait(rng:NextNumber(0.05, 0.16))
+	local finished = false
+	-- Dust, lamps and rumble end together: when the time is up or on stop.
+	local function finish()
+		if finished then
+			return
 		end
-		for _, lamp in lamps do
-			lamp.Part.Transparency = lamp.Transparency
-			if lamp.Light then
-				lamp.Light.Brightness = lamp.Brightness
-			end
-		end
-	end)
-	return function()
+		finished = true
 		running = false
 		for _, attachment in stops do
 			local emitter = attachment:FindFirstChildOfClass("ParticleEmitter")
@@ -590,7 +747,55 @@ function Effects.Quake(model: Model, center: Vector3, duration: number): () -> (
 			end
 			Debris:AddItem(attachment, 3)
 		end
+		if rumble and rumble.Parent then
+			TweenService:Create(rumble, TweenInfo.new(0.8, Enum.EasingStyle.Quad), { Volume = 0 }):Play()
+		end
+		Debris:AddItem(rumbleHolder, 0.9)
+		for _, lamp in lamps do
+			if calm then
+				if lamp.Part.Parent then
+					TweenService:Create(lamp.Part, TweenInfo.new(0.6, Enum.EasingStyle.Sine), { Transparency = lamp.Transparency }):Play()
+					if lamp.Light then
+						TweenService:Create(lamp.Light, TweenInfo.new(0.6, Enum.EasingStyle.Sine), { Brightness = lamp.Brightness }):Play()
+					end
+				end
+			else
+				lamp.Part.Transparency = lamp.Transparency
+				if lamp.Light then
+					lamp.Light.Brightness = lamp.Brightness
+				end
+			end
+		end
 	end
+	task.spawn(function()
+		local endAt = os.clock() + duration
+		if calm then
+			-- Reduce Motion: the lamps dim once instead of strobing
+			for _, lamp in lamps do
+				local dim = TweenInfo.new(0.4, Enum.EasingStyle.Sine)
+				TweenService:Create(lamp.Part, dim, { Transparency = math.max(lamp.Transparency, lamp.Transparency + (0.8 - lamp.Transparency) * 0.4) }):Play()
+				if lamp.Light then
+					TweenService:Create(lamp.Light, dim, { Brightness = lamp.Brightness * 0.5 }):Play()
+				end
+			end
+		end
+		while running and os.clock() < endAt do
+			if calm then
+				task.wait(0.1)
+			else
+				for _, lamp in lamps do
+					local on = rng:NextNumber() > 0.35
+					lamp.Part.Transparency = if on then lamp.Transparency else 0.8
+					if lamp.Light then
+						lamp.Light.Brightness = if on then lamp.Brightness else 0.1
+					end
+				end
+				task.wait(rng:NextNumber(0.05, 0.16))
+			end
+		end
+		finish()
+	end)
+	return finish
 end
 
 -- Short bright light at a point (welds, impacts).
@@ -676,29 +881,39 @@ function Effects.LightFan(center: Vector3 | BasePart, colors: { Color3 }, count:
 	}
 end
 
--- Crackling electric arcs around a point. Returns a stop function.
+-- Crackling electric arcs around a point: each arc is a jagged chain of short
+-- straight beams, re-randomised every tick. Returns a stop function.
 function Effects.Lightning(center: Vector3, color: Color3, radius: number?, arcs: number?): () -> ()
 	local n = if lowGraphics then 1 else (arcs or 3)
 	local r = radius or 4
+	local calm = reduceMotion
 	local rng = Random.new()
+	local segments = 6
 	local rigs = {}
 	for _ = 1, n do
-		local a0 = Instance.new("Attachment")
-		a0.Parent = workspace.Terrain
-		local a1 = Instance.new("Attachment")
-		a1.Parent = workspace.Terrain
-		local beam = Instance.new("Beam")
-		beam.Attachment0 = a0
-		beam.Attachment1 = a1
-		beam.Color = ColorSequence.new(Color3.new(1, 1, 1), color)
-		beam.LightEmission = 1
-		beam.Width0 = 0.25
-		beam.Width1 = 0.12
-		beam.Segments = 12
-		beam.FaceCamera = true
-		beam.Transparency = NumberSequence.new(0)
-		beam.Parent = a0
-		table.insert(rigs, { A0 = a0, A1 = a1, Beam = beam })
+		local points = {}
+		for _ = 0, segments do
+			local point = Instance.new("Attachment")
+			point.Parent = workspace.Terrain
+			table.insert(points, point)
+		end
+		local beams = {}
+		for k = 1, segments do
+			local f0, f1 = (k - 1) / segments, k / segments
+			local beam = Instance.new("Beam")
+			beam.Attachment0 = points[k]
+			beam.Attachment1 = points[k + 1]
+			beam.Color = ColorSequence.new(Color3.new(1, 1, 1):Lerp(color, f0), Color3.new(1, 1, 1):Lerp(color, f1))
+			beam.LightEmission = 1
+			beam.Width0 = 0.25 - 0.13 * f0
+			beam.Width1 = 0.25 - 0.13 * f1
+			beam.Segments = 1
+			beam.FaceCamera = true
+			beam.Transparency = NumberSequence.new(0)
+			beam.Parent = points[k]
+			table.insert(beams, beam)
+		end
+		table.insert(rigs, { Points = points, Beams = beams })
 	end
 	local running = true
 	task.spawn(function()
@@ -706,21 +921,49 @@ function Effects.Lightning(center: Vector3, color: Color3, radius: number?, arcs
 			for _, rig in rigs do
 				local p0 = center + Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.3, 1), rng:NextNumber(-1, 1)).Unit * r
 				local p1 = center + Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.3, 1), rng:NextNumber(-1, 1)).Unit * r
-				rig.A0.WorldPosition = p0
-				rig.A1.WorldPosition = p1
-				rig.Beam.CurveSize0 = rng:NextNumber(-4, 4)
-				rig.Beam.CurveSize1 = rng:NextNumber(-4, 4)
-				rig.Beam.Enabled = rng:NextNumber() > 0.25
+				local axis = p1 - p0
+				local length = axis.Magnitude
+				local side = axis:Cross(Vector3.yAxis)
+				if side.Magnitude < 1e-3 then
+					side = axis:Cross(Vector3.xAxis)
+				end
+				side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
+				local up = if length > 1e-3 then axis:Cross(side).Unit else Vector3.yAxis
+				local bow = rng:NextNumber(-0.3, 0.3) * length
+				local jag = length * 0.12
+				for k, point in rig.Points do
+					local f = (k - 1) / segments
+					local p = p0 + axis * f
+					if k > 1 and k <= segments then
+						p += side * (math.sin(f * math.pi) * bow + rng:NextNumber(-jag, jag)) + up * rng:NextNumber(-jag, jag)
+					end
+					point.WorldPosition = p
+				end
+				-- Reduce Motion: no on/off flicker, and a slower crackle below
+				local visible = calm or rng:NextNumber() > 0.25
+				for _, beam in rig.Beams do
+					beam.Enabled = visible
+				end
 			end
-			task.wait(0.06)
+			task.wait(if calm then 0.25 else 0.06)
 		end
 		for _, rig in rigs do
-			rig.A0:Destroy()
-			rig.A1:Destroy()
+			for _, point in rig.Points do
+				point:Destroy()
+			end
 		end
 	end)
 	return function()
+		if not running then
+			return
+		end
 		running = false
+		-- gone at once, not on the next tick
+		for _, rig in rigs do
+			for _, beam in rig.Beams do
+				beam.Enabled = false
+			end
+		end
 	end
 end
 
@@ -730,14 +973,13 @@ function Effects.ToScreen(position: Vector3): (Vector2, boolean)
 	return Vector2.new(point.X, point.Y), visible and point.Z > 0
 end
 
--- Absolute center of a GUI object in effects-layer coordinates.
-function Effects.GuiCenter(object: GuiObject): Vector2
-	local screenGui = object:FindFirstAncestorOfClass("ScreenGui")
-	local inset = Vector2.zero
-	if screenGui and not screenGui.IgnoreGuiInset then
-		inset = game:GetService("GuiService"):GetGuiInset()
-	end
-	return object.AbsolutePosition + object.AbsoluteSize / 2 + inset
+-- Center of a GUI object in effects-layer coordinates (or in `relativeTo`'s,
+-- e.g. another full-screen gui). Every AbsolutePosition is measured from the
+-- same origin (below the top bar, whatever IgnoreGuiInset says), so taking
+-- the layer's own AbsolutePosition off maps it exactly.
+function Effects.GuiCenter(object: GuiObject, relativeTo: GuiBase2d?): Vector2
+	local space: GuiBase2d = relativeTo or Effects.Layer()
+	return object.AbsolutePosition + object.AbsoluteSize / 2 - space.AbsolutePosition
 end
 
 return Effects
