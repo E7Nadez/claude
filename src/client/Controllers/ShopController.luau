@@ -9,6 +9,7 @@ local ContextActionService = game:GetService("ContextActionService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local Players = game:GetService("Players")
 local ProximityPromptService = game:GetService("ProximityPromptService")
+local TweenService = game:GetService("TweenService")
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local Net = require(Shared.Net)
@@ -58,6 +59,22 @@ local activeShow: any = nil
 local entryCooldown = 0
 local controlsLocked = false
 local lastLowGraphics: boolean? = nil
+-- Bumped by CancelAll (death, respawn): a waiting presentation must not start afterwards.
+local lifeToken = 0
+
+-- Handing the camera back: a short glide to where the follow camera picks up, then the
+-- release. Any acquire / release in between invalidates the pending one.
+local GLIDE_OUT = 0.4
+local releaseToken = 0
+local glidingOut = false
+-- The follow camera's zoom, pitch (look Y) and focus height before the shop took it.
+local followPose = { Zoom = 12.5, Pitch = -0.35, Height = 1.5 }
+
+-- The local player's own purchase is broadcast before its request returns, seconds before
+-- the show / reveal that presents the result: the world reaction (worker cheer, glow,
+-- fireworks) is held back until then.
+local reactionHolds = 0
+local heldReaction: { View: any, Rarity: string, Position: Vector3? }? = nil
 
 -- Character helpers -------------------------------------------------------------------
 
@@ -78,9 +95,34 @@ function ShopController:Teleport(cf: CFrame)
 	if not character or not root then
 		return
 	end
+	-- A glide back to the player would now chase them across the factory: hand the
+	-- camera back at once (teleports happen under a black screen).
+	if glidingOut then
+		releaseToken += 1
+		glidingOut = false
+		CameraDirector.Release("Shop")
+	end
 	character:PivotTo(cf)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Turns the default follow camera to look along `direction` (behind the character) at
+-- its zoom and pitch. After a teleport, under the black screen: the follow camera keeps
+-- its old yaw otherwise, and the player arrives looking at a wall.
+function ShopController:AimFollowCamera(direction: Vector3)
+	local root = self:GetRoot()
+	local flat = direction * Vector3.new(1, 0, 1)
+	if CameraDirector.IsActive() or not root or flat.Magnitude < 0.01 then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	local zoom = math.clamp((camera.CFrame.Position - camera.Focus.Position).Magnitude, 0.5, 128)
+	local y = math.clamp(camera.CFrame.LookVector.Y, -0.75, 0.1)
+	local look = flat.Unit * math.sqrt(1 - y * y) + Vector3.new(0, y, 0)
+	local focus = root.Position + Vector3.new(0, math.clamp(followPose.Height, 0, 4), 0)
+	-- The follow camera takes its look direction from the current CFrame.
+	camera.CFrame = CFrame.lookAt(focus - look * zoom, focus)
 end
 
 function ShopController:SetCharacterHidden(hidden: boolean)
@@ -143,6 +185,113 @@ local function lockControls(locked: boolean)
 	ProximityPromptService.Enabled = not locked
 end
 
+-- Camera hand-over ----------------------------------------------------------------------
+
+-- Takes the camera for a mode / show. Remembers how the follow camera framed the player,
+-- so releaseCamera can glide back to exactly that framing.
+local function acquireCamera()
+	releaseToken += 1
+	local wasGliding = glidingOut
+	glidingOut = false
+	local camera = workspace.CurrentCamera
+	if not CameraDirector.IsActive() then
+		local root = ShopController:GetRoot()
+		local focus = camera.Focus.Position
+		followPose.Zoom = (camera.CFrame.Position - focus).Magnitude
+		followPose.Pitch = camera.CFrame.LookVector.Y
+		followPose.Height = if root then focus.Y - root.Position.Y else 1.5
+	end
+	CameraDirector.Acquire("Shop", true)
+	if wasGliding then
+		-- Stopped mid-glide: hold this frame (not the previous owner's last shot) until the
+		-- new mode / show moves the camera.
+		CameraDirector.Snap(camera.CFrame, camera.FieldOfView)
+	end
+end
+
+-- How far behind `focus` the follow camera can sit before something solid is in the way
+-- (roughly its own occlusion check: see-through and non-colliding parts do not count).
+local function clearDistance(focus: Vector3, look: Vector3, zoom: number, ignore: { Instance }): number
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.RespectCanCollide = true
+	local list = table.clone(ignore)
+	for _ = 1, 4 do
+		params.FilterDescendantsInstances = list
+		local hit = workspace:Raycast(focus, -look * zoom, params)
+		if not hit then
+			return zoom
+		end
+		if hit.Instance.Transparency < 0.25 then
+			return math.max(hit.Distance - 0.5, 0.5)
+		end
+		table.insert(list, hit.Instance)
+	end
+	return zoom
+end
+
+-- Hands the camera back to the follow camera without a jump cut: glides to where that
+-- camera will pick up (along the current view towards the player, at the zoom and pitch
+-- it had before), then releases. First person, no character or far away: released at once.
+local function releaseCamera(self)
+	releaseToken += 1
+	glidingOut = false
+	if not CameraDirector.IsActive() then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	local character = LOCAL_PLAYER.Character
+	local root = self:GetRoot()
+	local zoom = math.min(followPose.Zoom, 128)
+	if not character or not root or zoom < 2 then
+		CameraDirector.Release("Shop")
+		return
+	end
+	local flat = (root.Position - camera.CFrame.Position) * Vector3.new(1, 0, 1)
+	if flat.Magnitude < 1 then
+		flat = root.CFrame.LookVector * Vector3.new(1, 0, 1)
+	end
+	if flat.Magnitude < 0.01 then
+		CameraDirector.Release("Shop")
+		return
+	end
+	local y = math.clamp(followPose.Pitch, -0.75, 0.1)
+	local look = flat.Unit * math.sqrt(1 - y * y) + Vector3.new(0, y, 0)
+	local height = math.clamp(followPose.Height, 0, 4)
+	local ignore = { character :: Instance }
+	local function pose(): CFrame
+		-- follows the player, who can walk again during the glide
+		local current = self:GetRoot() or root
+		local focus = current.Position + Vector3.new(0, height, 0)
+		return CFrame.lookAt(focus - look * clearDistance(focus, look, zoom, ignore), focus)
+	end
+	local from = camera.CFrame
+	local offset = pose().Position - from.Position
+	local distance = offset.Magnitude
+	-- A long way or through a wall (e.g. a skipped tube ride): a cut is cleaner than a swoop.
+	if distance > 60 or (distance > 0.5 and clearDistance(from.Position, -offset.Unit, distance, ignore) < distance) then
+		CameraDirector.Release("Shop")
+		return
+	end
+	local fovFrom = camera.FieldOfView
+	local fovTo = CameraDirector.BaseFov()
+	local start = os.clock()
+	CameraDirector.Follow(function()
+		local alpha = math.clamp((os.clock() - start) / GLIDE_OUT, 0, 1)
+		local e = TweenService:GetValue(alpha, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+		camera.FieldOfView = fovFrom + (fovTo - fovFrom) * e
+		return from:Lerp(pose(), e)
+	end)
+	glidingOut = true
+	local token = releaseToken
+	task.delay(GLIDE_OUT + 0.05, function()
+		if releaseToken == token then
+			glidingOut = false
+			CameraDirector.Release("Shop")
+		end
+	end)
+end
+
 -- Modes & shows --------------------------------------------------------------------------
 
 local function bindModeKeys(self)
@@ -200,8 +349,10 @@ function ShopController:EnterMode(name: string, onExit: () -> ()): boolean
 	if self.Classic.IsOpen then
 		self.Classic:Close()
 	end
+	-- (the settings card would sit over the focus shot and its panel)
+	self.Hud:CloseSettings()
 	mode = { Name = name, OnExit = onExit }
-	CameraDirector.Acquire("Shop", true)
+	acquireCamera()
 	lockControls(true)
 	bindModeKeys(self)
 	self.FactoryHud:ShowBack(function()
@@ -226,7 +377,7 @@ function ShopController:ExitMode(name: string?)
 	self.FactoryHud:HideCarousel()
 	self.FactoryHud:SetHint(nil)
 	if not activeShow then
-		CameraDirector.Release("Shop")
+		releaseCamera(self)
 		lockControls(false)
 	end
 end
@@ -244,11 +395,12 @@ function ShopController:BeginShow(seq, options: { Skippable: boolean? }?)
 		activeShow:Cancel()
 	end
 	activeShow = seq
-	self.Modal:Close(true)
+	-- (shrinks away under the letterbox instead of blinking out)
+	self.Modal:Close()
 	if self.Classic.IsOpen then
 		self.Classic:Close()
 	end
-	CameraDirector.Acquire("Shop", true)
+	acquireCamera()
 	lockControls(true)
 	self.FactoryHud:SetCinematic(true)
 	self.Hud:SetSideVisible(false)
@@ -268,17 +420,26 @@ function ShopController:EndShow(seq)
 	self.FactoryHud:SetCinematic(false)
 	self.Hud:SetSideVisible(true)
 	if not mode then
-		CameraDirector.Release("Shop")
+		releaseCamera(self)
 		lockControls(false)
+	end
+	-- (fallback for a show that did not play its purchase's world reaction itself)
+	if reactionHolds == 0 then
+		self:PlayPurchaseReactions()
 	end
 end
 
 function ShopController:CancelAll()
+	lifeToken += 1
+	heldReaction = nil
 	if activeShow then
 		activeShow:Cancel()
 	end
 	self:ExitMode()
 	self.Modal:Close(true)
+	-- No glide here: the camera goes back at once.
+	releaseToken += 1
+	glidingOut = false
 	CameraDirector.Release()
 	lockControls(false)
 	self:SetCharacterHidden(false)
@@ -315,6 +476,7 @@ function ShopController:TravelTo(view: any, zoneId: string, after: (() -> ())?)
 		local spot = view:ToWorld(zone.Spot)
 		local face = view.Origin:VectorToWorldSpace(zone.Face)
 		self:Teleport(CFrame.lookAt(spot, spot + face))
+		self:AimFollowCamera(face)
 		Audio.Play("Tube", { Speed = 1.6, Volume = 0.3 })
 		task.wait(0.12)
 		self.Hud:Fade(1, 0.3)
@@ -341,18 +503,54 @@ local function promptRobux(item: Shop.ShopItem): { [string]: any }
 	return { Ok = true, Pending = true }
 end
 
+-- Holds the local player's own purchase reaction back until its result is presented.
+-- Returns the release; a hold also lets go by itself (a request or reveal that hangs).
+local function holdReactions(self): () -> ()
+	reactionHolds += 1
+	local released = false
+	local function release()
+		if released then
+			return
+		end
+		released = true
+		reactionHolds -= 1
+		if reactionHolds == 0 and not activeShow then
+			self:PlayPurchaseReactions()
+		end
+	end
+	task.delay(12, release)
+	return release
+end
+
+-- Waits until the confirm modal has closed and shrunk away (it stamps its success first).
+local function waitForModal(self, timeout: number)
+	local modal = self.Modal
+	if not modal:IsOpen() then
+		return
+	end
+	local deadline = os.clock() + timeout
+	while modal:IsOpen() and os.clock() < deadline do
+		task.wait()
+	end
+	task.wait(0.22) -- ConfirmModal's close animation
+end
+
 -- Sends the request. The server validates price, balance, unlocks, limits.
 function ShopController:RequestPurchase(item: Shop.ShopItem): { [string]: any }
 	if item.Currency == "Robux" then
 		return promptRobux(item)
 	end
 	self.Hud:HoldCurrency(item.Currency, self.Hud:ShownCurrency(item.Currency))
+	-- The server broadcasts the purchase before it answers. Released once the caller has
+	-- started its show (callers do that right after this returns, before yielding).
+	local release = holdReactions(self)
 	local result
 	if item.Kind == "Upgrade" then
 		result = Net.Invoke("PurchaseUpgrade", item.RefId)
 	else
 		result = Net.Invoke("PurchaseItem", item.Id)
 	end
+	task.defer(release)
 	if not result.Ok then
 		self.Hud:ReleaseCurrency(item.Currency)
 		Audio.Play("Error")
@@ -360,14 +558,18 @@ function ShopController:RequestPurchase(item: Shop.ShopItem): { [string]: any }
 	return result
 end
 
--- Coins fly from the HUD to a world position / screen point / GUI object.
-function ShopController:CoinFlight(currencyId: string, amount: number, target: any, onCoin: ((number) -> ())?): number
+-- Coins fly from the HUD to a world position / screen point / GUI object. The held
+-- counter counts down to the live balance, or to `shownTarget` (a reward of the same
+-- currency still to be revealed; the counter then stays held until that reveal).
+function ShopController:CoinFlight(currencyId: string, amount: number, target: any, onCoin: ((number) -> ())?, shownTarget: number?): number
 	local anchor = self.Hud:GetCurrencyAnchor(currencyId)
 	if not anchor or amount <= 0 then
-		self.Hud:ReleaseCurrency(currencyId)
+		self.Hud:ReleaseCurrency(currencyId, nil, shownTarget)
 		return 0
 	end
-	local from = Effects.GuiCenter(anchor)
+	-- The pill itself, not its position now: as a show starts the HUD column slides down
+	-- below the letterbox, and the later coins leave from where it is then.
+	local from = anchor
 	local to: Vector2
 	if typeof(target) == "Vector3" then
 		to = Effects.ToScreen(target)
@@ -382,7 +584,7 @@ function ShopController:CoinFlight(currencyId: string, amount: number, target: a
 	local currency = Currencies.Get(currencyId)
 	local count = math.clamp(math.floor(math.log10(amount + 1) * 2.5), 4, 16)
 	local duration = Effects.CoinFlight(from, to, count, currency and currency.Glyph, onCoin)
-	self.Hud:ReleaseCurrency(currencyId, duration)
+	self.Hud:ReleaseCurrency(currencyId, duration, shownTarget)
 	return duration
 end
 
@@ -390,7 +592,17 @@ end
 function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any }, source: string)
 	local view = currentView
 	if source == "Factory" and view and item.Kind == "Vacuum" and item.World == view.World then
-		PurchaseShow.Play(view, item.RefId, result)
+		-- The confirm modal stamps its success and shrinks away first: the show (letterbox,
+		-- camera) starts once it is gone instead of cutting the modal off mid-spinner.
+		local release = holdReactions(self)
+		local life = lifeToken
+		waitForModal(self, 3)
+		local seq = if life == lifeToken and views[view.Model] == view and not activeShow then PurchaseShow.Play(view, item.RefId, result) else nil
+		if not seq then
+			-- No show will release the coin counter RequestPurchase held.
+			self.Hud:ReleaseCurrency(item.Currency)
+		end
+		release()
 		return
 	end
 	local rarityId = result.Rarity or item.Rarity
@@ -398,7 +610,12 @@ function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any 
 	local profile = Sequences.Get(rarityId)
 	local stamp = if item.Kind == "Capsule" or item.Kind == "DailyCrate" then "OPENED!" elseif item.Kind == "Upgrade" then "UPGRADED!" else "PURCHASED!"
 	local button = self.Classic.IsOpen and self.Classic:CelebrateFrom(item.Id, stamp, rarityId)
-	self:CoinFlight(item.Currency, result.Price or 0, button or nil)
+	-- A Mystery Crate paying out coins of the currency it cost: the counter only counts the
+	-- price off here, and counts the reward up once its coins fly in from the reveal.
+	local reward = if type(result.Reward) == "table" then result.Reward else {}
+	local price = result.Price or 0
+	local payout = item.Kind == "DailyCrate" and reward.Kind == "Coins" and (reward.Currency or "Coins") == item.Currency and (reward.Amount or 0) > 0
+	local paid = self:CoinFlight(item.Currency, price, button or nil, nil, if payout then self.Hud:ShownCurrency(item.Currency) - price else nil)
 	Audio.Play("Success")
 	local classicOpen = self.Classic.IsOpen
 	if item.Kind == "Vacuum" then
@@ -419,7 +636,6 @@ function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any 
 			self.Hud:Banner({ Title = if pet then pet.Name else "New pet", Subtitle = "You hatched  ·  " .. rarity.Name, Rarity = rarityId, Style = profile.Banner })
 		end
 	elseif item.Kind == "DailyCrate" then
-		local reward = result.Reward or {}
 		local text = reward.Name or "Reward"
 		if reward.Kind == "Coins" then
 			text = "+" .. Format.Abbreviate(reward.Amount or 0) .. " Coins"
@@ -440,6 +656,40 @@ function ShopController:_celebrate(item: Shop.ShopItem, result: { [string]: any 
 	elseif item.Kind == "Trophy" then
 		self.Hud:Banner({ Title = item.Name, Subtitle = "Trophy unlocked  ·  " .. rarity.Name, Rarity = rarityId, Style = "Big" })
 		Effects.UIConfetti(60)
+	end
+
+	-- The classic window's reveal flips its card once the modal is gone and the card has
+	-- wobbled (ClassicShop:Reveal): the world reaction and a coin payout wait for that.
+	local flipping = classicOpen and (item.Kind == "Capsule" or item.Kind == "DailyCrate")
+	if not flipping and not payout then
+		return
+	end
+	local start = os.clock()
+	if flipping then
+		local release = holdReactions(self)
+		waitForModal(self, 3)
+		-- zoom-in, 0.3 s per wobble, the flip (+ a few frames of slack)
+		task.wait(0.45 + profile.CapsuleWobble * 0.3 + 0.25)
+		release()
+	end
+	if payout then
+		-- (after the price has been counted off)
+		local remaining = paid + 0.15 - (os.clock() - start)
+		if remaining > 0 then
+			task.wait(remaining)
+		end
+		local currencyId = item.Currency
+		local anchor = self.Hud:GetCurrencyAnchor(currencyId)
+		local duration = 0
+		if anchor then
+			local window = self.Classic.Window
+			local from = if flipping and self.Classic.IsOpen and window then Effects.GuiCenter(window) else workspace.CurrentCamera.ViewportSize * Vector2.new(0.5, 0.24)
+			local currency = Currencies.Get(currencyId)
+			self.Hud:HoldCurrency(currencyId)
+			duration = Effects.CoinFlight(from, anchor, 14, currency and currency.Glyph)
+		end
+		task.wait(duration)
+		self.Hud:ReleaseCurrency(currencyId, 0.8)
 	end
 end
 
@@ -548,6 +798,20 @@ local VERBS = {
 	CoinPack = "bought",
 }
 
+-- The factory reacts to a purchase: worker robots cheer (and burst a glow on the local
+-- buyer), Epic+ launch fireworks.
+local function reactWorld(view: any, rarityId: string, position: Vector3?, isMe: boolean)
+	local rarity = Rarities.Get(rarityId)
+	local workers = view.Zones.Workers
+	if workers then
+		workers:React(position, rarityId, isMe)
+	end
+	local fireworks = Sequences.Get(rarityId).Fireworks
+	if fireworks > 0 and view.Zones.Spectacle then
+		view.Zones.Spectacle:Fireworks({ rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1), view.Theme.Neon }, fireworks)
+	end
+end
+
 function ShopController:_onBroadcast(payload: any)
 	if type(payload) ~= "table" or type(payload.ItemName) ~= "string" or type(payload.UserId) ~= "number" then
 		return
@@ -558,6 +822,8 @@ function ShopController:_onBroadcast(payload: any)
 	local position = if typeof(payload.Position) == "Vector3" then payload.Position else nil
 	local sameFactory = currentView ~= nil and payload.World == currentView.World
 
+	local item = if type(payload.ItemId) == "string" then Shop.Get(payload.ItemId) else nil
+
 	if not isMe and (payload.Scope == "Server" or (payload.Scope == "Factory" and sameFactory)) then
 		local verb = VERBS[payload.Kind] or "got"
 		self.Hud:Feed(string.format("<b>%s</b> %s <font color=\"#%s\">%s</font>!", escapeRich(tostring(payload.DisplayName or "?")), verb, rarity.Color:ToHex(), escapeRich(payload.ItemName)), rarityId)
@@ -565,27 +831,78 @@ function ShopController:_onBroadcast(payload: any)
 			Effects.ScreenFlash(rarity.Color, 0.2, 0.8)
 		end
 	end
+	if isMe and item and Shop.IsRobux(item) then
+		task.spawn(self._celebrateRobux, self, item, rarityId)
+	end
 
 	for _, view in views do
 		if view.Near and payload.World == view.World then
-			local workers = view.Zones.Workers
-			if workers then
-				workers:React(position, rarityId, isMe)
-			end
-			if not isMe and position then
-				Effects.Confetti(position + Vector3.new(0, 3, 0), 8 * rarity.Rank, { rarity.Gradient[1], rarity.Gradient[2] }, 0.6)
-				Effects.Burst(position, "Glow", 6 * rarity.Rank, rarity.Color)
-			end
-			local fireworks = Sequences.Get(rarityId).Fireworks
-			if fireworks > 0 and view.Zones.Spectacle then
-				view.Zones.Spectacle:Fireworks({ rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1), view.Theme.Neon }, fireworks)
-			end
-			if not isMe and payload.Kind == "Capsule" and view.Zones.CapsuleHall then
-				local item = Shop.Get(payload.ItemId)
-				if item then
+			if isMe then
+				local capsules = view.Zones.CapsuleHall
+				if payload.Kind == "Capsule" and item and capsules and capsules:DeferPurchaseReactions(item.RefId) then
+					-- (the capsule show plays it at its reveal)
+				elseif reactionHolds > 0 or activeShow then
+					-- the show / reveal presenting this purchase plays it (PlayPurchaseReactions)
+					if not heldReaction or rarity.Rank >= Rarities.Get(heldReaction.Rarity).Rank then
+						heldReaction = { View = view, Rarity = rarityId, Position = position }
+					end
+				else
+					reactWorld(view, rarityId, position, true)
+				end
+			else
+				reactWorld(view, rarityId, position, false)
+				if position then
+					Effects.Confetti(position + Vector3.new(0, 3, 0), 8 * rarity.Rank, { rarity.Gradient[1], rarity.Gradient[2] }, 0.6)
+					Effects.Burst(position, "Glow", 6 * rarity.Rank, rarity.Color)
+				end
+				if payload.Kind == "Capsule" and item and view.Zones.CapsuleHall then
 					view.Zones.CapsuleHall:RemoteOpened(item.RefId, rarityId)
 				end
 			end
+		end
+	end
+end
+
+-- Plays the held world reaction to the local player's own purchase: the worker robots
+-- cheer, a rarity glow bursts at `position` (default: the player) and Epic+ fire rockets.
+-- Shows call this at their reveal; EndShow does it as a fallback.
+function ShopController:PlayPurchaseReactions(position: Vector3?)
+	local held = heldReaction
+	heldReaction = nil
+	if not held or views[held.View.Model] ~= held.View or not held.View.Near then
+		return
+	end
+	local root = self:GetRoot()
+	reactWorld(held.View, held.Rarity, position or (if root then root.Position else held.Position), true)
+end
+
+-- Robux purchases finish in Roblox's own prompt; the server's broadcast of the grant is
+-- the moment to celebrate them (the confirm modal only said "Checkout…").
+function ShopController:_celebrateRobux(item: Shop.ShopItem, rarityId: string)
+	local rarity = Rarities.Get(rarityId)
+	local profile = Sequences.Get(rarityId)
+	local subtitle = "Unlocked forever  ·  " .. rarity.Name
+	if item.Kind == "CoinPack" then
+		local data = self.ClientData:Get()
+		local amount = if data then Shop.CoinPackAmount(item.RefId, data) else 0
+		subtitle = if amount > 0 then "+" .. Format.Abbreviate(amount) .. " Coins  ·  " .. rarity.Name else "Coins added  ·  " .. rarity.Name
+	elseif item.Kind == "Boost" then
+		local boost = Boosts.Get(item.RefId)
+		subtitle = "Boost active  ·  " .. Format.Duration(boost and boost.Duration or 0)
+	end
+	if self.Classic.IsOpen then
+		self.Classic:CelebrateFrom(item.Id, if item.Kind == "Gamepass" then "UNLOCKED!" else "PURCHASED!", rarityId)
+	end
+	Audio.Play("Success")
+	self.Hud:Banner({ Title = item.Name, Subtitle = subtitle, Rarity = rarityId, Style = if profile.Banner == "Small" then "Big" else profile.Banner })
+	Effects.ScreenFlash(rarity.Color, 0.25, 0.6)
+	Effects.UIConfetti(math.floor(profile.Confetti / 2), { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) })
+	if item.Kind == "CoinPack" then
+		-- the coins pour from the banner into the pill (which counts them up on the sync)
+		local anchor = self.Hud:GetCurrencyAnchor("Coins")
+		if anchor then
+			local currency = Currencies.Get("Coins")
+			Effects.CoinFlight(workspace.CurrentCamera.ViewportSize * Vector2.new(0.5, 0.24), anchor, 16, currency and currency.Glyph)
 		end
 	end
 end
@@ -655,9 +972,19 @@ function ShopController:_tick()
 			if trigger and trigger:IsA("BasePart") and inTrigger(trigger, position) then
 				entryCooldown = os.clock() + 4
 				if self.ClientData:Setting("ClassicShop") == true then
-					local back = view:ToWorld(Vector3.new(0, 3, -22))
-					self:Teleport(CFrame.lookAt(back, back + view.Origin:VectorToWorldSpace(Vector3.new(0, 0, -1))))
-					self.Classic:Open()
+					-- Back out of the doorway under a quick fade like every other teleport,
+					-- then the window opens.
+					task.spawn(function()
+						self.Hud:Fade(0, 0.15)
+						if not activeShow and not mode then
+							local back = view:ToWorld(Vector3.new(0, 3, -22))
+							local away = view.Origin:VectorToWorldSpace(Vector3.new(0, 0, -1))
+							self:Teleport(CFrame.lookAt(back, back + away))
+							self:AimFollowCamera(away)
+							self.Classic:Open()
+						end
+						self.Hud:Fade(1, 0.25)
+					end)
 				else
 					EntryShow.Play(view)
 				end

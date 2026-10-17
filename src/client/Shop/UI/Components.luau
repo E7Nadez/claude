@@ -55,6 +55,19 @@ function UI.new(className: string, props: { [string]: any }?, children: { Instan
 	return instance
 end
 
+-- Relative luminance (WCAG) of a colour, to pick legible text on it.
+local function luminance(color: Color3): number
+	local function linear(c: number): number
+		return if c <= 0.04045 then c / 12.92 else ((c + 0.055) / 1.055) ^ 2.4
+	end
+	return 0.2126 * linear(color.R) + 0.7152 * linear(color.G) + 0.0722 * linear(color.B)
+end
+
+-- Light two-colour fills (gold, mint, silver) wash out white text.
+local function isLightFill(colors: { Color3 }): boolean
+	return luminance(colors[1]:Lerp(colors[2] or colors[1], 0.5)) > 0.3
+end
+
 function UI.Corner(radius: UDim?): UICorner
 	return UI.new("UICorner", { CornerRadius = radius or Theme.Radius.Medium })
 end
@@ -194,30 +207,50 @@ function UI.Wiggle(object: GuiObject, degrees: number?)
 	end)
 end
 
+-- Resting position and latest shake per object: a shake started mid-shake must
+-- not take the shifted position as its origin (repeated taps would drift it).
+local shakeOrigins: { [Instance]: UDim2 } = setmetatable({}, { __mode = "k" }) :: any
+local shakeTokens: { [Instance]: {} } = setmetatable({}, { __mode = "k" }) :: any
+
 -- Horizontal error shake.
 function UI.Shake(object: GuiObject)
-	local origin = object.Position
+	local origin = shakeOrigins[object] or object.Position
+	shakeOrigins[object] = origin
+	local token = {}
+	shakeTokens[object] = token
 	task.spawn(function()
 		for _, x in { 10, -8, 6, -4, 2, 0 } do
+			if shakeTokens[object] ~= token then
+				return
+			end
 			object.Position = origin + UDim2.fromOffset(x, 0)
 			task.wait(0.035)
 		end
-		object.Position = origin
+		if shakeTokens[object] == token then
+			object.Position = origin
+			shakeOrigins[object] = nil
+			shakeTokens[object] = nil
+		end
 	end)
 end
 
 -- Count a TextLabel from one number to another.
-local counters: { [Instance]: NumberValue } = setmetatable({}, { __mode = "k" }) :: any
+local counters: { [Instance]: { Value: NumberValue, Tween: Tween } } = setmetatable({}, { __mode = "k" }) :: any
 
 function UI.CountTo(label: TextLabel, from: number, to: number, duration: number?, format: ((number) -> string)?, tick: boolean?)
 	local fmt = format or Format.Abbreviate
+	-- A newer count replaces a running one, which must not write its old target when it ends.
 	local previous = counters[label]
+	counters[label] = nil
 	if previous then
-		previous:Destroy()
+		previous.Tween:Cancel()
+		previous.Value:Destroy()
 	end
 	local value = Instance.new("NumberValue")
 	value.Value = from
-	counters[label] = value
+	local tween = TweenService:Create(value, TweenInfo.new(duration or 0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Value = to })
+	local entry = { Value = value, Tween = tween }
+	counters[label] = entry
 	local lastText = ""
 	local lastTick = 0
 	value.Changed:Connect(function(v)
@@ -232,11 +265,10 @@ function UI.CountTo(label: TextLabel, from: number, to: number, duration: number
 		end
 	end)
 	label.Text = fmt(from)
-	local tween = TweenService:Create(value, TweenInfo.new(duration or 0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Value = to })
 	tween.Completed:Connect(function()
-		label.Text = fmt(to)
-		if counters[label] == value then
+		if counters[label] == entry then
 			counters[label] = nil
+			label.Text = fmt(to)
 		end
 		value:Destroy()
 	end)
@@ -254,16 +286,30 @@ export type Button = {
 	Enabled: boolean,
 }
 
+local SHINE_LEAN = math.tan(math.rad(20))
+
 -- Animated button: hover lift + shine, press squish, spring release.
 function UI.Button(props: { [string]: any }): Button
 	local style = props.Style or "Primary"
 	local colors = Theme.ButtonStyles[style] or Theme.ButtonStyles.Primary
+	-- Hover, press and pop scale about the AnchorPoint: anchor the same rectangle at
+	-- its centre so the button grows in place, not over its neighbours (a layout
+	-- places its children itself, so those keep the caller's anchor).
+	local size = props.Size or UDim2.fromOffset(160, 48)
+	local position = props.Position or UDim2.new()
+	local anchor = props.AnchorPoint or Vector2.zero
+	local center = Vector2.new(0.5, 0.5)
+	if anchor ~= center and not (props.Parent and props.Parent:FindFirstChildWhichIsA("UIGridStyleLayout")) then
+		local dx, dy = center.X - anchor.X, center.Y - anchor.Y
+		position += UDim2.new(size.X.Scale * dx, math.round(size.X.Offset * dx), size.Y.Scale * dy, math.round(size.Y.Offset * dy))
+		anchor = center
+	end
 	local instance = UI.new("TextButton", {
 		Name = props.Name or "Button",
 		Text = "",
-		Size = props.Size or UDim2.fromOffset(160, 48),
-		Position = props.Position or UDim2.new(),
-		AnchorPoint = props.AnchorPoint or Vector2.zero,
+		Size = size,
+		Position = position,
+		AnchorPoint = anchor,
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		BackgroundTransparency = if style == "Ghost" then 0.3 else 0,
 		LayoutOrder = props.LayoutOrder or 0,
@@ -279,22 +325,26 @@ function UI.Button(props: { [string]: any }): Button
 	gradient.Parent = instance
 	local scale = getScale(instance)
 
+	-- Hover sweep: a gradient band on a full-size overlay with the button's corners.
+	-- It stays inside the rounded shape (ClipsDescendants clips square and is
+	-- ignored under rotated ancestors) and is fully transparent at rest.
 	local shine = UI.new("Frame", {
 		Name = "Shine",
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		BackgroundTransparency = 0.75,
-		Size = UDim2.new(0.25, 0, 2, 0),
-		Position = UDim2.new(-0.4, 0, -0.5, 0),
-		Rotation = 20,
+		Size = UDim2.fromScale(1, 1),
 		ZIndex = (props.ZIndex or 1) + 1,
 		Parent = instance,
-	}, {
-		UI.Gradient({ Color3.new(1, 1, 1), Color3.new(1, 1, 1) }, 0, NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 1),
-			NumberSequenceKeypoint.new(0.5, 0.2),
-			NumberSequenceKeypoint.new(1, 1),
-		})),
-	})
+	}, { UI.Corner(props.Radius or Theme.Radius.Medium) })
+	local shineGradient = UI.Gradient({ Color3.new(1, 1, 1) }, 20, NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.375, 1),
+		NumberSequenceKeypoint.new(0.5, 0.2),
+		NumberSequenceKeypoint.new(0.625, 1),
+		NumberSequenceKeypoint.new(1, 1),
+	}))
+	shineGradient.Offset = Vector2.new(-1, 0)
+	shineGradient.Parent = shine
 
 	local label = UI.Label({
 		Name = "Label",
@@ -311,17 +361,43 @@ function UI.Button(props: { [string]: any }): Button
 	UI.new("UITextSizeConstraint", { MaxTextSize = props.TextSize or 18, MinTextSize = 10, Parent = label })
 	label.TextScaled = true
 	UI.Padding(4, 10).Parent = label
+	-- Outlines the letters on light fills (see refreshLook).
+	local textStroke = UI.new("UIStroke", {
+		Name = "TextStroke",
+		Thickness = 1.5,
+		Transparency = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual,
+		Parent = label,
+	})
 
-	local spinner = UI.Label({
+	-- Loading spinner: a bright arc over a faint track, a square sized from the
+	-- button height. The arc's gradient turns, so no GuiObject is rotated.
+	local spinner = UI.new("Frame", {
 		Name = "Spinner",
-		Text = "◌",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.4, 0.4),
+		SizeConstraint = Enum.SizeConstraint.RelativeYY,
+		BackgroundTransparency = 1,
 		Visible = false,
-		Size = UDim2.fromScale(1, 1),
-		TextXAlignment = Enum.TextXAlignment.Center,
-		TextSize = 24,
 		ZIndex = (props.ZIndex or 1) + 3,
 		Parent = instance,
-	})
+	}, { UI.Corner(Theme.Radius.Pill), UI.Stroke(Color3.new(1, 1, 1), 0.78, 3) })
+	local arcStroke = UI.Stroke(Color3.new(1, 1, 1), 0, 3)
+	local arcGradient = UI.Gradient({ Color3.new(1, 1, 1) }, 0, NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.12, 0),
+		NumberSequenceKeypoint.new(0.3, 1),
+		NumberSequenceKeypoint.new(1, 1),
+	}))
+	arcGradient.Parent = arcStroke
+	UI.new("Frame", {
+		Name = "Arc",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = (props.ZIndex or 1) + 3,
+		Parent = spinner,
+	}, { UI.Corner(Theme.Radius.Pill), arcStroke })
 
 	local button = {} :: Button
 	button.Instance = instance
@@ -333,8 +409,12 @@ function UI.Button(props: { [string]: any }): Button
 
 	local function refreshLook()
 		local active = button.Enabled and not loading
-		gradient.Color = ColorSequence.new(table.unpack(if active then Theme.ButtonStyles[style] or colors else Theme.ButtonStyles.Disabled))
+		local fill = if active then Theme.ButtonStyles[style] or colors else Theme.ButtonStyles.Disabled
+		gradient.Color = ColorSequence.new(table.unpack(fill))
 		label.TextTransparency = if active then 0 else 0.35
+		-- White text on gold or mint needs a dark outline to stay readable.
+		textStroke.Color = fill[#fill]:Lerp(Color3.new(0, 0, 0), 0.7)
+		textStroke.Transparency = if isLightFill(fill) then 0.35 else 1
 		instance.Selectable = active
 	end
 
@@ -346,8 +426,14 @@ function UI.Button(props: { [string]: any }): Button
 		Audio.Play("Hover")
 		UI.Tween(scale, Theme.Tween.Fast, { Scale = props.HoverScale or 1.05 })
 		UI.Tween(stroke, Theme.Tween.Fast, { Transparency = 0.35 })
-		shine.Position = UDim2.new(-0.4, 0, -0.5, 0)
-		UI.Tween(shine, TweenInfo.new(0.45, Enum.EasingStyle.Quad), { Position = UDim2.new(1.2, 0, -0.5, 0) })
+		-- The gradient stretches with the button: correct its angle so the band
+		-- leans 20° on screen whatever the aspect ratio.
+		local absolute = instance.AbsoluteSize
+		if absolute.X > 0 and absolute.Y > 0 then
+			shineGradient.Rotation = math.deg(math.atan(SHINE_LEAN * absolute.Y / absolute.X))
+		end
+		shineGradient.Offset = Vector2.new(-1, 0)
+		UI.Tween(shineGradient, TweenInfo.new(0.45, Enum.EasingStyle.Quad), { Offset = Vector2.new(1, 0) })
 	end
 
 	local function hoverOut()
@@ -409,18 +495,25 @@ function UI.Button(props: { [string]: any }): Button
 		end
 		if isLoading then
 			spinConnection = RunService.RenderStepped:Connect(function(dt)
-				spinner.Rotation = (spinner.Rotation + dt * 360) % 360
+				arcGradient.Rotation = (arcGradient.Rotation + dt * 360) % 360
 			end)
 		else
-			spinner.Rotation = 0
+			arcGradient.Rotation = 0
 		end
 		refreshLook()
 	end
 
-	function button.Destroy(_: Button)
+	local function stopSpin()
 		if spinConnection then
 			spinConnection:Disconnect()
+			spinConnection = nil
 		end
+	end
+	-- The button can be destroyed with its window while it is still loading.
+	instance.Destroying:Connect(stopSpin)
+
+	function button.Destroy(_: Button)
+		stopSpin()
 		instance:Destroy()
 	end
 
@@ -508,6 +601,8 @@ function UI.RarityTag(rarityId: string, props: { [string]: any }?): Frame
 		UI.Corner(Theme.Radius.Pill),
 		UI.Gradient(Rarities.ColorSequence(rarity.Id), 0),
 	})
+	-- Light tiers (silver, green, gold) get dark ink tinted with the tier colour:
+	-- small white text on them is unreadable.
 	UI.Label({
 		Text = string.upper(rarity.Name),
 		Size = UDim2.fromScale(1, 1),
@@ -515,6 +610,7 @@ function UI.RarityTag(rarityId: string, props: { [string]: any }?): Frame
 		TextSize = 12,
 		TextScaled = true,
 		FontFace = Theme.Fonts.Title,
+		TextColor3 = if isLightFill(rarity.Gradient) then rarity.Gradient[1]:Lerp(Color3.new(0, 0, 0), 0.78) else Theme.Colors.Text,
 		ZIndex = (p.ZIndex or 1) + 1,
 		Parent = tag,
 	})
@@ -583,7 +679,11 @@ function UI.AutoScale(gui: Instance): UIScale
 	local function update()
 		scale.Scale = UI.ScaleFor(camera.ViewportSize)
 	end
-	camera:GetPropertyChangedSignal("ViewportSize"):Connect(update)
+	local connection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(update)
+	-- Lets go of the camera when the scale (or the gui holding it) is destroyed.
+	scale.Destroying:Connect(function()
+		connection:Disconnect()
+	end)
 	update()
 	return scale
 end
