@@ -26,6 +26,12 @@ local CameraDirector = require(ShopFolder.CameraDirector)
 local UpgradeLab = {}
 UpgradeLab.__index = UpgradeLab
 
+local GROW_TIME = 0.7
+-- The builders stand every machine 0.4 above its `base` frame; that frame sits
+-- this far under the top of the base plate, so the machines stand on the plate
+-- (0.05 into it) instead of hovering half a stud above it.
+local PLATE_SINK = 0.45
+
 local function part(model: Model, props: { [string]: any }): BasePart
 	local p = Builder.Part(props)
 	p.CanCollide = false
@@ -52,24 +58,33 @@ function Machines.Tank(model: Model, base: CFrame, level: number, theme, color: 
 		Transparency = 0.55,
 	})
 	liquid:SetAttribute("Pulse", true)
-	for i = 1, math.floor(level / 5) + 1 do
-		part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.25, diameter + 0.25, diameter + 0.25), CFrame = base * CFrame.new(0, 0.4 + i * height / (math.floor(level / 5) + 2), 0) * CFrame.Angles(0, 0, math.pi / 2), Color = color, Material = Enum.Material.Neon })
+	local bands = math.floor(level / 5) + 1
+	for i = 1, bands do
+		part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.25, diameter + 0.25, diameter + 0.25), CFrame = base * CFrame.new(0, 0.4 + i * height / (bands + 1), 0) * CFrame.Angles(0, 0, math.pi / 2), Color = color, Material = Enum.Material.Neon })
 	end
 	part(model, { Shape = Enum.PartType.Ball, Size = Vector3.one * diameter, CFrame = base * CFrame.new(0, height + 0.4, 0), Color = theme.Trim, Material = Enum.Material.Metal })
-	part(model, { Size = Vector3.new(0.6, 0.6, 2.4), CFrame = base * CFrame.new(diameter / 2 + 0.6, height * 0.5, 0), Color = theme.Metal, Material = Enum.Material.Metal })
+	-- feed pipe: out of the tank wall (below the first band), elbow, down into the plate
+	local wall = diameter * 0.51
+	local pipeY = 0.4 + height / (bands + 1) / 2
+	part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(1.3, 0.55, 0.55), CFrame = base * CFrame.new(wall + 0.45, pipeY, 0), Color = theme.Metal, Material = Enum.Material.Metal })
+	part(model, { Shape = Enum.PartType.Ball, Size = Vector3.one * 0.75, CFrame = base * CFrame.new(wall + 1.1, pipeY, 0), Color = theme.Metal, Material = Enum.Material.Metal })
+	part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(pipeY - 0.3, 0.55, 0.55), CFrame = base * CFrame.new(wall + 1.1, (pipeY + 0.3) / 2, 0) * CFrame.Angles(0, 0, math.pi / 2), Color = theme.Metal, Material = Enum.Material.Metal })
 end
 
 function Machines.Nozzle(model: Model, base: CFrame, level: number, theme, color: Color3)
 	local rings = 3 + math.floor(level / 4)
 	local maxRadius = 1.4 + level * 0.13
-	part(model, { Size = Vector3.new(2.6, 3, 2.6), CFrame = base * CFrame.new(0, 1.9, 2), Color = theme.Metal, Material = Enum.Material.Metal })
+	-- The horn's axis (and the body under it) rises with the mouth, so the widest
+	-- rings and the rim stay above the base plate instead of cutting into it.
+	local axisY = math.max(3.4, maxRadius + 0.85)
+	part(model, { Size = Vector3.new(2.6, axisY - 0.4, 2.6), CFrame = base * CFrame.new(0, (axisY + 0.4) / 2, 2), Color = theme.Metal, Material = Enum.Material.Metal })
 	for i = 1, rings do
 		local t = i / rings
 		local radius = 0.6 + (maxRadius - 0.6) * t
 		part(model, {
 			Shape = Enum.PartType.Cylinder,
 			Size = Vector3.new(0.9, radius * 2, radius * 2),
-			CFrame = base * CFrame.new(0, 3.4, 1.2 - i * 0.8) * CFrame.Angles(0, math.pi / 2, 0),
+			CFrame = base * CFrame.new(0, axisY, 1.2 - i * 0.8) * CFrame.Angles(0, math.pi / 2, 0),
 			Color = theme.Trim:Lerp(color, t * 0.4),
 			Material = Enum.Material.Metal,
 			Reflectance = 0.15,
@@ -78,7 +93,7 @@ function Machines.Nozzle(model: Model, base: CFrame, level: number, theme, color
 	local rim = part(model, {
 		Shape = Enum.PartType.Cylinder,
 		Size = Vector3.new(0.2, maxRadius * 2 + 0.3, maxRadius * 2 + 0.3),
-		CFrame = base * CFrame.new(0, 3.4, 1.2 - rings * 0.8 - 0.5) * CFrame.Angles(0, math.pi / 2, 0),
+		CFrame = base * CFrame.new(0, axisY, 1.2 - rings * 0.8 - 0.5) * CFrame.Angles(0, math.pi / 2, 0),
 		Color = color,
 		Material = Enum.Material.Neon,
 	})
@@ -95,7 +110,9 @@ function Machines.Turbine(model: Model, base: CFrame, level: number, theme, colo
 		p.Parent = model
 	end
 	part(model, { Size = Vector3.new(1, radius + 1, 1), CFrame = base * CFrame.new(0, (radius + 1) / 2, 0.9), Color = theme.Metal, Material = Enum.Material.Metal })
-	local speed = 2 + level * 0.45
+	-- Capped so a 30 Hz update (Low Graphics, slow devices) turns the rotor by at
+	-- most 40 % of the blade spacing: faster reads as strobing or spinning backwards.
+	local speed = math.min(2 + level * 0.45, 24 * math.pi / blades)
 	local hub = part(model, { Shape = Enum.PartType.Ball, Size = Vector3.one * 1.2, CFrame = center, Color = color, Material = Enum.Material.Neon })
 	hub:SetAttribute("Spin", speed)
 	for i = 1, blades do
@@ -114,12 +131,14 @@ end
 function Machines.Motor(model: Model, base: CFrame, level: number, theme, color: Color3)
 	local pistons = math.min(1 + math.floor(level / 4), 7)
 	local width = 2.6 + pistons * 0.9
-	part(model, { Size = Vector3.new(width, 2.2 + level * 0.06, 3.2), CFrame = base * CFrame.new(0, 1.5, 0), Color = theme.Metal, Material = Enum.Material.Metal })
-	part(model, { Size = Vector3.new(width + 0.2, 0.25, 3.4), CFrame = base * CFrame.new(0, 2.7 + level * 0.06, 0), Color = color, Material = Enum.Material.Neon })
+	-- the block grows upwards from the plate; the neon strip and the pistons ride on its top
+	local blockHeight = 2.2 + level * 0.06
+	part(model, { Size = Vector3.new(width, blockHeight, 3.2), CFrame = base * CFrame.new(0, 0.4 + blockHeight / 2, 0), Color = theme.Metal, Material = Enum.Material.Metal })
+	part(model, { Size = Vector3.new(width + 0.2, 0.25, 3.4), CFrame = base * CFrame.new(0, 0.5 + blockHeight, 0), Color = color, Material = Enum.Material.Neon })
 	local speed = 3 + level * 0.35
 	for i = 1, pistons do
 		local x = -width / 2 + (i - 0.5) * (width / pistons)
-		local piston = part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(2.2, 0.7, 0.7), CFrame = base * CFrame.new(x, 4, 0) * CFrame.Angles(0, 0, math.pi / 2), Color = theme.Trim, Material = Enum.Material.Metal, Reflectance = 0.2 })
+		local piston = part(model, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(2.2, 0.7, 0.7), CFrame = base * CFrame.new(x, 1.8 + blockHeight, 0) * CFrame.Angles(0, 0, math.pi / 2), Color = theme.Trim, Material = Enum.Material.Metal, Reflectance = 0.2 })
 		piston:SetAttribute("Piston", speed)
 		piston:SetAttribute("Phase", i * 1.3)
 	end
@@ -133,6 +152,7 @@ function UpgradeLab.new(view)
 	self.Trove:Add(self.ActiveTrove, "Clean")
 	self.Machines = {}
 	self.Focused = nil :: string?
+	self.PanelKey = nil :: string?
 
 	for _, upgrade in Upgrades.List do
 		local model = view:Find("UpgradeLab/Machine_" .. upgrade.Id)
@@ -145,16 +165,24 @@ function UpgradeLab.new(view)
 				Visual = nil :: Model?,
 				Level = -1,
 				Parts = {},
+				Plate = nil :: CFrame?,
+				SpinCenter = nil :: CFrame?,
+				Top = 0,
+				Reach = 0,
+				GrowStart = nil :: number?,
+				LevelTag = nil :: BasePart?,
 			}
 		end
 	end
 
-	self.Trove:Connect(view.Controller.ClientData.Changed, function()
+	self.Trove:Connect(view.Controller.ClientData.Changed, function(_, previous)
 		if view.Near then
-			self:_refresh(true)
+			-- (the first snapshot after joining is no level-up: machines built before
+			-- the profile arrived stood at level 0)
+			self:_refresh(previous ~= nil)
 		end
 		if self.Focused then
-			self:_showPanel(self.Focused)
+			self:_showPanel(self.Focused, true)
 		end
 	end)
 	return self
@@ -166,24 +194,60 @@ function UpgradeLab:_mountCFrame(machine): CFrame
 	return CFrame.lookAt(pos, Vector3.new(center.X, pos.Y, center.Z))
 end
 
+-- Top of the machine's base plate (the Mount marker floats 0.1 above it), facing
+-- the lab centre: machines stand and grow on it.
+function UpgradeLab:_plateCFrame(machine): CFrame
+	local mountCf = self:_mountCFrame(machine)
+	local plate = machine.Server:FindFirstChild("Base")
+	local top = if plate and plate:IsA("BasePart") then plate.Position.Y + plate.Size.Y / 2 else mountCf.Y - 0.1
+	return mountCf + Vector3.new(0, top - mountCf.Y, 0)
+end
+
 function UpgradeLab:_build(machine, level: number)
 	if machine.Visual then
+		self.ActiveTrove:Remove(machine.Visual)
 		machine.Visual:Destroy()
 	end
 	local model = Instance.new("Model")
 	model.Name = "Upgrade_" .. machine.Upgrade.Id
 	local color = Rarities.Get(machine.Upgrade.Rarity).Color
 	local builder = Machines[machine.Upgrade.Machine]
-	builder(model, self:_mountCFrame(machine), level, self.View.Theme, color)
+	local plate = self:_plateCFrame(machine)
+	builder(model, plate * CFrame.new(0, -PLATE_SINK, 0), level, self.View.Theme, color)
 	model.Parent = self.View.LocalFolder
 	machine.Visual = model
+	machine.Plate = plate
+	machine.GrowStart = nil
 	machine.Parts = {}
-	local mountCf = self:_mountCFrame(machine)
+	-- Animation data is read once here, not every frame. Top / Reach (height over
+	-- the plate, reach towards the lab centre) frame the camera and the level tag.
+	local spinCenter = model:GetAttribute("SpinCenter")
+	local top, reach = 0, 0
 	for _, p in model:GetDescendants() do
 		if p:IsA("BasePart") then
-			table.insert(machine.Parts, { Part = p, Home = p.CFrame, Rel = mountCf:ToObjectSpace(p.CFrame), Size = p.Size })
+			local rel = plate:ToObjectSpace(p.CFrame)
+			local size = p.Size
+			local halfY = (math.abs(rel.XVector.Y) * size.X + math.abs(rel.YVector.Y) * size.Y + math.abs(rel.ZVector.Y) * size.Z) / 2
+			local halfZ = (math.abs(rel.XVector.Z) * size.X + math.abs(rel.YVector.Z) * size.Y + math.abs(rel.ZVector.Z) * size.Z) / 2
+			local piston = p:GetAttribute("Piston")
+			top = math.max(top, rel.Y + halfY + (if piston then 0.6 else 0))
+			reach = math.max(reach, halfZ - rel.Z)
+			local spin = p:GetAttribute("Spin")
+			table.insert(machine.Parts, {
+				Part = p,
+				Home = p.CFrame,
+				Size = size,
+				Spin = if typeof(spin) == "number" and typeof(spinCenter) == "CFrame" then spin else nil,
+				SpinRel = if typeof(spinCenter) == "CFrame" then spinCenter:ToObjectSpace(p.CFrame) else nil,
+				Piston = if typeof(piston) == "number" then piston else nil,
+				Phase = p:GetAttribute("Phase") or 0,
+				Pulse = p:GetAttribute("Pulse") == true,
+			})
 		end
 	end
+	machine.SpinCenter = if typeof(spinCenter) == "CFrame" then spinCenter else nil
+	machine.Top = top
+	machine.Reach = reach
 	self.ActiveTrove:Add(model)
 end
 
@@ -232,64 +296,155 @@ end
 
 function UpgradeLab:_refresh(animate: boolean)
 	local clientData = self.View.Controller.ClientData
+	local celebrate = animate and self:_inView()
 	for id, machine in self.Machines do
 		local level = clientData:UpgradeLevel(id)
 		if level ~= machine.Level then
 			local previous = machine.Level
 			self:_build(machine, level)
 			self:_updateSign(machine, level, animate)
-			if animate and previous >= 0 and level > previous then
-				self:_celebrate(machine)
-			end
 			machine.Level = level
+			if celebrate and previous >= 0 and level > previous then
+				self:_celebrate(machine, level)
+				if self.Focused == id then
+					-- the camera eases back to frame the bigger machine
+					self:_frame(machine, 0.9)
+				end
+			end
+		end
+	end
+end
+
+-- The level-up show only plays where the player can see it: focused on a machine
+-- or walking in the lab, and not behind the shop window. Elsewhere (an upgrade
+-- bought from the window in the lobby) the machine is just rebuilt.
+function UpgradeLab:_inView(): boolean
+	local controller = self.View.Controller
+	if controller.Classic and controller.Classic.IsOpen then
+		return false
+	end
+	if self.Focused then
+		return true
+	end
+	local root = controller:GetRoot()
+	return root ~= nil and self.View:RoomAt(root.Position) == "UpgradeLab"
+end
+
+-- Poses one machine for this frame: blades spin, pistons pump and, after a level
+-- up, every part grows from 60 % out of the base plate (in this loop, so the
+-- growth composes with the spin instead of a tween fighting it). The glass / rim
+-- pulse is written only when `pulse` is set.
+function UpgradeLab:_stepMachine(machine, t: number, pulse: boolean, parts: { BasePart }, frames: { CFrame })
+	local plate = machine.Plate
+	if not machine.Visual or not plate then
+		return
+	end
+	local grow: number? = nil
+	if machine.GrowStart then
+		local alpha = (t - machine.GrowStart) / GROW_TIME
+		if alpha < 1 then
+			local style = if Effects.ReduceMotion() then Enum.EasingStyle.Quad else Enum.EasingStyle.Back
+			grow = 0.6 + 0.4 * TweenService:GetValue(math.max(alpha, 0), style, Enum.EasingDirection.Out)
+		else
+			-- (this last growth frame puts every part back to its full size)
+			machine.GrowStart = nil
+			grow = 1
+		end
+	end
+	local spinCenter = machine.SpinCenter
+	for _, entry in machine.Parts do
+		local p = entry.Part
+		local cf: CFrame? = nil
+		if entry.Spin and spinCenter then
+			cf = spinCenter * CFrame.Angles(0, 0, t * entry.Spin) * entry.SpinRel
+		elseif entry.Piston then
+			cf = entry.Home + Vector3.new(0, math.sin(t * entry.Piston + entry.Phase) * 0.6, 0)
+		elseif pulse and entry.Pulse then
+			p.Transparency = 0.35 + 0.25 * math.sin(t * 3)
+		end
+		if grow then
+			local rel = plate:ToObjectSpace(cf or entry.Home)
+			cf = plate * (CFrame.new(rel.Position * grow) * rel.Rotation)
+			p.Size = entry.Size * grow
+		end
+		if cf then
+			table.insert(parts, p)
+			table.insert(frames, cf)
 		end
 	end
 end
 
 -- Growth animation + sparks when a machine levels up.
-function UpgradeLab:_celebrate(machine)
-	local mountCf = self:_mountCFrame(machine)
-	local color = Rarities.Get(machine.Upgrade.Rarity).Color
-	for _, entry in machine.Parts do
-		local p = entry.Part
-		p.Size = entry.Size * 0.6
-		p.CFrame = mountCf * (CFrame.new(entry.Rel.Position * 0.6) * entry.Rel.Rotation)
-		TweenService:Create(p, TweenInfo.new(0.7, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = entry.Size, CFrame = entry.Home }):Play()
+function UpgradeLab:_celebrate(machine, level: number)
+	local plate = machine.Plate
+	if not plate then
+		return
 	end
-	Effects.Burst(mountCf.Position + Vector3.new(0, 3, 0), "Sparks", 40, color)
-	Effects.Burst(mountCf.Position + Vector3.new(0, 3, 0), "Glow", 16, color)
-	Effects.Shockwave(mountCf.Position, color, 9)
-	Effects.FlashLight(mountCf.Position + Vector3.new(0, 4, 0), color, 6, 22, 0.6)
-	Audio.PlayAt("Weld", mountCf.Position)
-	Audio.Play("Success")
-	-- "LEVEL UP" label rising out of the machine
+	local color = Rarities.Get(machine.Upgrade.Rarity).Color
+	local top = machine.Top
+	machine.GrowStart = os.clock()
+	-- the shrunken start pose shows at once, not one full-size frame first
+	local parts, frames = {}, {}
+	self:_stepMachine(machine, machine.GrowStart, false, parts, frames)
+	if #parts > 0 then
+		workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
+	end
+	local middle = plate.Position + Vector3.new(0, math.max(top * 0.5, 2), 0)
+	Effects.Burst(middle, "Sparks", 40, color)
+	Effects.Burst(middle, "Glow", 16, color)
+	Effects.Shockwave(plate.Position + Vector3.new(0, 0.1, 0), color, 6.5)
+	Effects.FlashLight(middle + Vector3.new(0, 1, 0), color, 6, 22, 0.6)
+	-- (positional only: the purchase itself already played the "Success" chime)
+	Audio.PlayAt("Weld", middle)
+	-- "LEVEL UP" tag rising from just above the machine; a new level replaces the
+	-- last tag instead of stacking on it
+	if machine.LevelTag then
+		machine.LevelTag:Destroy()
+	end
 	local anchor = Builder.Part({
 		Name = "LevelUpAnchor",
 		Size = Vector3.one * 0.2,
-		CFrame = mountCf * CFrame.new(0, 6, 0),
+		CFrame = plate * CFrame.new(0, top + 1.4, 0),
 		Transparency = 1,
 		CanCollide = false,
 		CanQuery = false,
 		CanTouch = false,
 		Parent = self.View.LocalFolder,
 	})
-	local tag = UI.new("BillboardGui", { Size = UDim2.fromOffset(260, 70), AlwaysOnTop = true, Adornee = anchor, Parent = anchor })
+	machine.LevelTag = anchor
+	self.ActiveTrove:Add(anchor)
+	-- (studs + pixels: scales with the shot, stays readable on a phone)
+	local tag = UI.new("BillboardGui", { Name = "LevelUpTag", Size = UDim2.new(4, 110, 1.1, 30), AlwaysOnTop = true, MaxDistance = 120, Adornee = anchor, Parent = anchor })
 	local label = UI.Label({
-		Text = "LEVEL UP!  LV " .. tostring(math.max(machine.Level + 1, 1)),
+		Text = "LEVEL UP!  LV " .. tostring(level),
 		Size = UDim2.fromScale(1, 1),
 		TextXAlignment = Enum.TextXAlignment.Center,
 		TextScaled = true,
 		FontFace = Theme.Fonts.Title,
 		TextColor3 = color:Lerp(Color3.new(1, 1, 1), 0.3),
-		TextStrokeTransparency = 0.3,
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
 		Parent = tag,
 	})
-	TweenService:Create(tag, TweenInfo.new(1.6, Enum.EasingStyle.Quint), { StudsOffset = Vector3.new(0, 5, 0) }):Play()
+	UI.Tween(label, Theme.Tween.Fast, { TextTransparency = 0, TextStrokeTransparency = 0.3 })
+	if not Effects.ReduceMotion() then
+		local scale = UI.GetScale(label)
+		scale.Scale = 0.6
+		UI.Tween(scale, Theme.Tween.Spring, { Scale = 1 })
+		-- (a short rise: it ends just under the level sign behind the machine)
+		UI.Tween(tag, TweenInfo.new(1.6, Enum.EasingStyle.Quint), { StudsOffset = Vector3.new(0, 1.6, 0) })
+	end
 	task.delay(1, function()
-		TweenService:Create(label, TweenInfo.new(0.6), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+		if label.Parent then
+			UI.Tween(label, TweenInfo.new(0.6), { TextTransparency = 1, TextStrokeTransparency = 1 })
+		end
 	end)
 	task.delay(1.7, function()
+		self.ActiveTrove:Remove(anchor)
 		anchor:Destroy()
+		if machine.LevelTag == anchor then
+			machine.LevelTag = nil
+		end
 	end)
 end
 
@@ -299,38 +454,37 @@ function UpgradeLab:SetActive(active: boolean)
 		machine.Visual = nil
 		machine.Level = -1
 		machine.Parts = {}
+		machine.GrowStart = nil
+		machine.LevelTag = nil
 	end
 	if not active then
 		return
 	end
 	self:_refresh(false)
-	local accumulator = 0
+	-- Blades, pistons and growth move every frame while the camera is near the lab
+	-- (Low Graphics or far away: an even 30 Hz), so fast rotors never strobe; the
+	-- pulse is written at 30 Hz (15 Hz).
+	local center = self.View:ToWorld(Factory.UpgradeLab.Center)
+	local accumulator, pulseAccumulator = 0, 0
 	self.ActiveTrove:Connect(RunService.Heartbeat, function(dt)
+		local low = Effects.IsLow()
+		local near = (workspace.CurrentCamera.CFrame.Position - center).Magnitude < 110
+		local interval = if low or not near then 1 / 30 else 0
 		accumulator += dt
-		if accumulator < (if Effects.IsLow() then 1 / 15 else 1 / 30) then
+		pulseAccumulator += dt
+		if accumulator < interval then
 			return
 		end
-		accumulator = 0
+		accumulator = if interval > 0 then math.min(accumulator - interval, interval) else 0
+		local pulseInterval = if low then 1 / 15 else 1 / 30
+		local pulse = pulseAccumulator >= pulseInterval
+		if pulse then
+			pulseAccumulator = math.min(pulseAccumulator - pulseInterval, pulseInterval)
+		end
 		local t = os.clock()
 		local parts, frames = {}, {}
 		for _, machine in self.Machines do
-			local visual = machine.Visual
-			local spinCenter = visual and visual:GetAttribute("SpinCenter")
-			for _, entry in machine.Parts do
-				local p = entry.Part
-				local spin = p:GetAttribute("Spin")
-				local piston = p:GetAttribute("Piston")
-				if spin and typeof(spinCenter) == "CFrame" then
-					local rel = spinCenter:ToObjectSpace(entry.Home)
-					table.insert(parts, p)
-					table.insert(frames, spinCenter * CFrame.Angles(0, 0, t * spin) * rel)
-				elseif piston then
-					table.insert(parts, p)
-					table.insert(frames, entry.Home + Vector3.new(0, math.sin(t * piston + (p:GetAttribute("Phase") or 0)) * 0.6, 0))
-				elseif p:GetAttribute("Pulse") then
-					p.Transparency = 0.35 + 0.25 * math.sin(t * 3)
-				end
-			end
+			self:_stepMachine(machine, t, pulse, parts, frames)
 		end
 		if #parts > 0 then
 			workspace:BulkMoveTo(parts, frames, Enum.BulkMoveMode.FireCFrameChanged)
@@ -340,7 +494,9 @@ end
 
 -- Focus mode -------------------------------------------------------------------------------
 
-function UpgradeLab:_showPanel(upgradeId: string)
+-- onlyIfChanged: data updates rebuild the panel (pop + tick) only when what it
+-- shows changed, not on every unrelated snapshot.
+function UpgradeLab:_showPanel(upgradeId: string, onlyIfChanged: boolean?)
 	local controller = self.View.Controller
 	local clientData = controller.ClientData
 	local data = clientData:Get()
@@ -352,6 +508,11 @@ function UpgradeLab:_showPanel(upgradeId: string)
 	local level = clientData:UpgradeLevel(upgradeId)
 	local maxed = level >= upgrade.MaxLevel
 	local price = Shop.GetPrice(item, data)
+	local key = string.format("%s|%d|%s|%s", upgradeId, level, tostring(price), tostring(Shop.CanAfford(item, data)))
+	if onlyIfChanged and key == self.PanelKey then
+		return
+	end
+	self.PanelKey = key
 	local now = Upgrades.Multiplier(upgradeId, level) - 1
 	local nextValue = Upgrades.Multiplier(upgradeId, math.min(level + 1, upgrade.MaxLevel)) - 1
 	controller.FactoryHud:ShowPanel({
@@ -406,8 +567,27 @@ function UpgradeLab:_buy(upgradeId: string)
 		controller.Hud:Toast(result.Error or "Upgrade failed.", "Error")
 		return
 	end
+	-- (the only chime: the machine's level-up show adds positional sound only)
+	Audio.Play("Success")
 	controller:CoinFlight("Coins", result.Price or 0, machine.Mount.Position + Vector3.new(0, 3, 0))
 	controller.Hud:Toast(string.format("%s upgraded to Lv %d!", item.Name, result.Level or 0), "Success")
+end
+
+-- Frames the whole machine as it stands now (a level 25 tank is three times as
+-- tall as a new one, the wide nozzle reaches out towards the camera) from the
+-- lab side, a little to the right. The level sign stands behind the machine; the
+-- aim never drops below 3.6 so it stays inside the shot of a small machine.
+-- Without a duration the glide takes as long as the distance needs.
+function UpgradeLab:_frame(machine, duration: number?)
+	local plate = machine.Plate or self:_plateCFrame(machine)
+	local top = if machine.Visual then machine.Top else 6
+	local reach = if machine.Visual then machine.Reach else 2
+	local aim = plate.Position + Vector3.new(0, math.max(top / 2, 3.6), 0) + plate.LookVector * (reach * 0.4)
+	local distance = math.max(15, math.max(top, 4) * 1.6 + reach * 0.8)
+	local side = (plate.LookVector * 15 + plate.RightVector * 3).Unit
+	local camPos = aim + side * distance + Vector3.new(0, distance * 0.3, 0)
+	local glide = duration or math.clamp((workspace.CurrentCamera.CFrame.Position - camPos).Magnitude / 45, 0.7, 1.6)
+	CameraDirector.GlideTo(CFrame.lookAt(camPos, aim), glide, if glide > 0.75 then Enum.EasingStyle.Sine else Enum.EasingStyle.Quint, 60)
 end
 
 function UpgradeLab:Focus(upgradeId: string)
@@ -418,6 +598,8 @@ function UpgradeLab:Focus(upgradeId: string)
 	end
 	if not controller:EnterMode("UpgradeLab", function()
 		self.Focused = nil
+		self.PanelKey = nil
+		controller:SetCharacterHidden(false)
 		controller.FactoryHud:HidePanel()
 		controller.FactoryHud:HideCarousel()
 		controller.FactoryHud:SetHint(nil)
@@ -425,9 +607,9 @@ function UpgradeLab:Focus(upgradeId: string)
 		return
 	end
 	self.Focused = upgradeId
-	local mountCf = self:_mountCFrame(machine)
-	local camPos = mountCf.Position + mountCf.LookVector * 15 + Vector3.new(0, 8, 0) + mountCf.RightVector * 3
-	CameraDirector.GlideTo(CFrame.lookAt(camPos, mountCf.Position + Vector3.new(0, 3.5, 0)), 0.7, Enum.EasingStyle.Quint, 60)
+	-- (the player stands at the console, right between this camera and the machine)
+	controller:SetCharacterHidden(true)
+	self:_frame(machine)
 	local order = {}
 	for _, upgrade in Upgrades.List do
 		table.insert(order, upgrade.Id)

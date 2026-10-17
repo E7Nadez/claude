@@ -29,8 +29,80 @@ local Theme = require(ShopFolder.UI.Theme)
 
 local PurchaseShow = {}
 
+-- Showroom podium 5 stands between the front camera and the bay (12 studs in
+-- front of it, faded by the Showroom while the show looks through it), podium
+-- 4's hologram right beside it: the assembly orbit only drifts towards the coin
+-- pillar, and the hero orbit runs closer to the bay than podium 5. To get there
+-- it first pushes in over the faded podium, then swings round, which keeps it
+-- clear of the hologram (a cut or a straight line would run through one of them).
+local ORBIT_SWING = 0.2 -- radians, assembly orbit drifts 0 .. -2x this
+local HERO_RADIUS = 10.5
+local HERO_HEIGHT = 4.5 -- above the bay center
+local HERO_START = 0.45 -- radians gained while swinging in from the front camera
+local HERO_SWEEP = 1.9 -- total radians of the hero orbit
+local HERO_PUSH = 0.6 -- seconds to push in (radius, height, aim)
+local HERO_BLEND = 0.9 -- seconds to swing in (angle)
+local HERO_SPIN = 1.2 -- the vacuum turns with the camera: ends on a 3/4 front view
+local TAG_SIZE = Vector2.new(7, 1.7) -- hero name tag, studs
+local TAG_GAP = 0.3
+-- Deeper than a fully stretched arm (shoulder 1.6 + lower 3.2 + upper 2.8 +
+-- claws), so a lowered arm is hidden below the deck.
+local ARM_SINK = 9
+
 local function ease(t: number, style: Enum.EasingStyle?): number
 	return TweenService:GetValue(math.clamp(t, 0, 1), style or Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)
+end
+
+-- The exit tube is a closed ring of glass panes. These are the panes facing
+-- `toward` (from the tube axis): faded locally so the vacuum flies in and the
+-- player steps out through an opening instead of through the glass.
+local function tubeDoor(bay: Instance, tube: Vector3, toward: Vector3): { BasePart }
+	local panes = {}
+	local flat = toward * Vector3.new(1, 0, 1)
+	if flat.Magnitude < 0.01 then
+		return panes
+	end
+	for _, child in bay:GetChildren() do
+		if child:IsA("BasePart") and child.Material == Enum.Material.Glass then
+			local offset = (child.Position - tube) * Vector3.new(1, 0, 1)
+			local distance = offset.Magnitude
+			if distance > 3 and distance < 5 and offset.Unit:Dot(flat.Unit) > 0.75 then
+				table.insert(panes, child)
+			end
+		end
+	end
+	return panes
+end
+
+local function setPanes(panes: { BasePart }, amount: number)
+	for _, pane in panes do
+		if pane.Parent then
+			pane.LocalTransparencyModifier = amount
+		end
+	end
+end
+
+-- Fades panes to `goal` on a short thread of its own: it always finishes, so the
+-- door also closes after the show was skipped or cancelled.
+local function fadePanes(panes: { BasePart }, goal: number, duration: number, delay: number?)
+	if #panes == 0 then
+		return
+	end
+	task.delay(delay or 0, function()
+		local from = panes[1].LocalTransparencyModifier
+		if from == goal then
+			return
+		end
+		local start = os.clock()
+		while true do
+			local alpha = math.clamp((os.clock() - start) / duration, 0, 1)
+			setPanes(panes, from + (goal - from) * alpha)
+			if alpha >= 1 then
+				return
+			end
+			RunService.Heartbeat:Wait()
+		end
+	end)
 end
 
 -- Runs fn(alpha) every frame for `duration`. Returns false if the sequence stopped.
@@ -73,7 +145,25 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 	local config = Factory.AssemblyBay
 	local center = view:ToWorld(config.Center)
 	local cameraPos = view:ToWorld(config.Camera)
-	local frontCam = CFrame.lookAt(cameraPos, center + Vector3.new(0, 2.5, 0))
+	local frontAim = center + Vector3.new(0, 2.5, 0)
+	local frontCam = CFrame.lookAt(cameraPos, frontAim)
+	-- the front camera in orbit terms (around the bay center): orbits start there
+	local frontOffset = cameraPos - center
+	local frontRadius = Vector3.new(frontOffset.X, 0, frontOffset.Z).Magnitude
+	local frontAngle = math.atan2(frontOffset.Z, frontOffset.X)
+	local beltEnd = view:ToWorld(config.ConveyorEnd)
+	local tube = view:ToWorld(config.ExitTube)
+	local step = view:ToWorld(config.ExitStep)
+	local inDoor = tubeDoor(bay, tube, beltEnd - tube)
+	local outDoor = tubeDoor(bay, tube, step - tube)
+	-- The belt carries the vacuum: its slats run at the vacuum's speed meanwhile.
+	local conveyor = bay:FindFirstChild("Conveyor")
+	local idleSpeed = conveyor and conveyor:GetAttribute("BeltSpeed")
+	local function driveBelt(speed: number?)
+		if conveyor and conveyor.Parent and typeof(idleSpeed) == "number" then
+			conveyor:SetAttribute("BeltSpeed", if speed then math.max(speed, idleSpeed) else idleSpeed)
+		end
+	end
 
 	local seq = Sequence.new("Purchase")
 	local state = { Placed = false, Banner = false }
@@ -93,11 +183,12 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 	end
 
 	local function stepOut(s)
-		local tube = view:ToWorld(config.ExitTube)
-		local step = view:ToWorld(config.ExitStep)
 		controller:Teleport(CFrame.lookAt(tube + Vector3.new(0, 3.2, 0), Vector3.new(step.X, tube.Y + 3.2, step.Z)))
 		state.Placed = true
 		controller:SetCharacterHidden(false)
+		-- open the glass towards the step while the player walks out, then close it
+		fadePanes(outDoor, 1, 0.2)
+		fadePanes(outDoor, 0, 0.35, 1.2)
 		local humanoid = controller:GetHumanoid()
 		if humanoid then
 			humanoid:MoveTo(step)
@@ -118,22 +209,32 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 	local cine = Cinematics.Begin({ Bloom = 0.55 + rarity.Rank * 0.08 })
 	cine:Focus(center + Vector3.new(0, 2, 0))
 	seq:Run(function(s)
-		CameraDirector.GlideTo(frontCam, timings.CameraGlide, Enum.EasingStyle.Quint, 60)
+		-- the player "steps out of the tube" at the end: keep them out of the shots
+		-- (stepOut shows them again, CancelAll does on death / leaving)
+		controller:SetCharacterHidden(true)
+		-- The coin slot stands far left of the bay, outside the assembly framing:
+		-- aim between slot and bay so the coins land on screen, then settle.
+		local slot = bay:FindFirstChild("CoinSlot") :: BasePart?
+		local coinSlot = if slot and result.Price and result.Price > 0 then slot else nil
+		local firstShot = if coinSlot then CFrame.lookAt(cameraPos, coinSlot.Position:Lerp(frontAim, 0.55)) else frontCam
+		CameraDirector.GlideTo(firstShot, timings.CameraGlide, Enum.EasingStyle.Quint, 60)
 		if not s:Wait(timings.CameraGlide * 0.8) then
 			return
 		end
 
 		-- 1) Coins into the slot
-		local slot = bay:FindFirstChild("CoinSlot") :: BasePart?
-		if slot and result.Price and result.Price > 0 then
-			local flight = controller:CoinFlight(result.Currency or "Coins", result.Price, slot.Position, function()
-				slot.Color = Color3.new(1, 1, 1)
-				TweenService:Create(slot, TweenInfo.new(0.2), { Color = Color3.fromRGB(255, 210, 70) }):Play()
+		if coinSlot then
+			local slotColor = coinSlot.Color
+			local flight = controller:CoinFlight(result.Currency or "Coins", result.Price, coinSlot.Position, function()
+				coinSlot.Color = Color3.new(1, 1, 1)
+				TweenService:Create(coinSlot, TweenInfo.new(0.2), { Color = slotColor }):Play()
 			end)
 			if not s:Wait(flight + 0.15) then
 				return
 			end
-			Audio.PlayAt("Clank", slot.Position)
+			Audio.PlayAt("Clank", coinSlot.Position)
+			-- settles while the arms rise, before the assembly orbit takes over
+			CameraDirector.GlideTo(frontCam, 0.55, Enum.EasingStyle.Sine, 60)
 		end
 
 		-- 2) Robot arms rise
@@ -157,9 +258,12 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 			s.Trove:Add(model)
 			local outward = ((mount.Position - center) * Vector3.new(1, 0, 1)).Unit
 			local rest = mount.Position + Vector3.new(0, 6, 0) + outward * 1.5
+			local base = CFrame.new(mount.Position + Vector3.new(0, mount.Size.X / 2, 0))
+			-- posed below the deck right away: it is built at the world origin
+			RobotModel.ReachArm(model, base - Vector3.new(0, ARM_SINK, 0), rest, 1)
 			table.insert(arms, {
 				Model = model,
-				Base = CFrame.new(mount.Position + Vector3.new(0, mount.Size.X / 2, 0)),
+				Base = base,
 				Outward = outward,
 				Target = rest,
 				Current = rest,
@@ -171,8 +275,13 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		s.Trove:Connect(RunService.Heartbeat, function(dt)
 			for _, arm in arms do
 				arm.Rise += (arm.RiseGoal - arm.Rise) * math.min(dt * 5, 1)
+				local base = arm.Base - Vector3.new(0, (1 - arm.Rise) * ARM_SINK, 0)
+				if arm.RiseGoal == 0 then
+					-- lowering: fold down towards the sinking base instead of
+					-- stretching up out of the deck
+					arm.Target = base.Position + arm.Outward * 2 + Vector3.new(0, 0.6, 0)
+				end
 				arm.Current = arm.Current:Lerp(arm.Target, math.min(dt * 14, 1))
-				local base = arm.Base - Vector3.new(0, (1 - arm.Rise) * 5, 0)
 				RobotModel.ReachArm(arm.Model, base, arm.Current, arm.Open)
 			end
 		end)
@@ -212,15 +321,15 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 			table.insert(stops, Effects.Lightning(center + Vector3.new(0, 2.5, 0), rarity.Color, 5, 3))
 		end
 		if profile.Orbit and not Effects.ReduceMotion() then
-			local offset = cameraPos - center
-			local radius = Vector3.new(offset.X, 0, offset.Z).Magnitude
-			local baseAngle = math.atan2(offset.Z, offset.X)
 			local orbitStart = os.clock()
 			CameraDirector.Follow(function()
 				local t = os.clock() - orbitStart
-				local angle = baseAngle + math.sin(t * 0.6) * 0.55
-				local pos = center + Vector3.new(math.cos(angle) * radius, offset.Y + math.sin(t * 0.8) * 1.2, math.sin(angle) * radius)
-				return CFrame.lookAt(pos, center + Vector3.new(0, 2.5, 0))
+				-- starts at the front camera and drifts towards the coin pillar only:
+				-- the other way podium 4's hologram swings into the frame, and past
+				-- ~0.45 rad podium 5 leaves the faded camera-to-bay corridor
+				local angle = frontAngle - ORBIT_SWING + math.cos(t * 0.6) * ORBIT_SWING
+				local pos = center + Vector3.new(math.cos(angle) * frontRadius, frontOffset.Y + math.sin(t * 0.8) * 1.2, math.sin(angle) * frontRadius)
+				return CFrame.lookAt(pos, frontAim)
 			end)
 		end
 
@@ -305,7 +414,6 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		Audio.Play("Boom")
 		for _, arm in arms do
 			arm.RiseGoal = 0
-			arm.Target = arm.Base.Position + Vector3.new(0, 3, 0)
 		end
 		if not animate(s, 0.9, function(alpha)
 			model:PivotTo(rootCf * CFrame.Angles(0, ease(alpha) * math.pi * 2, 0) + Vector3.new(0, math.sin(alpha * math.pi) * 1.5, 0))
@@ -318,12 +426,20 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 			cine:Tension(0.03)
 			local fan = Effects.LightFan(center + Vector3.new(0, 2.4, 0), { rarity.Gradient[1], rarity.Gradient[2], Color3.new(1, 1, 1) }, 12, 16)
 			table.insert(stops, fan.Stop)
+			-- The tag is sized in studs (scales with the shot instead of covering half
+			-- a phone screen) and sits just above the model's real top.
+			local boxCf, boxSize = model:GetBoundingBox()
+			local halfHeight = (math.abs(boxCf.RightVector.Y) * boxSize.X + math.abs(boxCf.UpVector.Y) * boxSize.Y + math.abs(boxCf.LookVector.Y) * boxSize.Z) / 2
+			local top = boxCf.Position.Y + halfHeight
+			local bottom = boxCf.Position.Y - halfHeight
+			local adornee = model.PrimaryPart
+			local anchorY = if adornee then adornee.Position.Y else model:GetPivot().Position.Y
 			local tag = UI.new("BillboardGui", {
 				Name = "HeroTag",
-				Size = UDim2.fromOffset(420, 110),
-				StudsOffset = Vector3.new(0, 6.5, 0),
+				Size = UDim2.fromScale(TAG_SIZE.X, TAG_SIZE.Y),
+				StudsOffsetWorldSpace = Vector3.new(0, top - anchorY + TAG_GAP + TAG_SIZE.Y / 2, 0),
 				AlwaysOnTop = true,
-				Adornee = model.PrimaryPart,
+				Adornee = adornee,
 				Parent = model,
 			})
 			local name = UI.Label({
@@ -336,7 +452,7 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 				Parent = tag,
 			})
 			UI.Gradient({ Color3.new(1, 1, 1), rarity.Color:Lerp(Color3.new(1, 1, 1), 0.3) }, 90).Parent = name
-			UI.Label({
+			local rarityLine = UI.Label({
 				Text = rarity.Glyph .. "  " .. string.upper(rarity.Name) .. "  " .. rarity.Glyph,
 				Position = UDim2.fromScale(0, 0.64),
 				Size = UDim2.fromScale(1, 0.3),
@@ -348,18 +464,32 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 				Parent = tag,
 			})
 			UIFx.Typewriter(name, 0.6)
-			local radius = (cameraPos - center).Magnitude * 0.75
-			local startAngle = math.atan2(cameraPos.Z - center.Z, cameraPos.X - center.X)
+			-- frames the vacuum together with its tag (and the 0.8 stud bob)
+			local heroAim = Vector3.new(center.X, (bottom + top + TAG_GAP + TAG_SIZE.Y + 0.8) / 2, center.Z)
 			local heroStart = os.clock()
 			CameraDirector.Follow(function()
 				local t = os.clock() - heroStart
-				local a = startAngle + TweenService:GetValue(math.min(t / timings.HeroShot, 1), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut) * 1.9
-				local pos = center + Vector3.new(math.cos(a) * radius, 3.2 + math.sin(t * 0.8) * 0.6, math.sin(a) * radius)
-				return CFrame.lookAt(pos, center + Vector3.new(0, 2.4, 0))
+				-- starts exactly at the front camera: push in, swing round, orbit
+				local push = ease(t / HERO_PUSH, Enum.EasingStyle.Sine)
+				local swing = ease(t / HERO_BLEND, Enum.EasingStyle.Sine)
+				local sweep = TweenService:GetValue(math.min(t / timings.HeroShot, 1), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut) * (HERO_SWEEP - HERO_START)
+				local a = frontAngle + HERO_START * swing + sweep
+				local radius = frontRadius + (HERO_RADIUS - frontRadius) * push
+				local height = frontOffset.Y + (HERO_HEIGHT + math.sin(t * 0.8) * 0.5 - frontOffset.Y) * push
+				local pos = center + Vector3.new(math.cos(a) * radius, height, math.sin(a) * radius)
+				return CFrame.lookAt(pos, frontAim:Lerp(heroAim, push))
 			end)
 			local spinStart = model:GetPivot()
 			if not animate(s, timings.HeroShot, function(alpha)
-				model:PivotTo(spinStart * CFrame.Angles(0, alpha * math.pi * 0.6, 0) + Vector3.new(0, math.sin(alpha * math.pi) * 0.8, 0))
+				-- turns with the camera, so the shot ends on a 3/4 front view with the
+				-- nose already towards the belt
+				model:PivotTo(spinStart * CFrame.Angles(0, -alpha * HERO_SPIN, 0) + Vector3.new(0, math.sin(alpha * math.pi) * 0.8, 0))
+				-- fade the tag out over the last 0.3 s instead of popping it
+				local fade = math.clamp((alpha - 1) * timings.HeroShot / 0.3 + 1, 0, 1)
+				for _, label in { name, rarityLine } do
+					label.TextTransparency = fade
+					label.TextStrokeTransparency = 0.5 + 0.5 * fade
+				end
 			end) then
 				return
 			end
@@ -369,25 +499,37 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 		end
 
 		-- 5) Conveyor to the exit tube
-		local beltEnd = view:ToWorld(config.ConveyorEnd)
-		local sideCam = view:ToWorld(Vector3.new(14, 9, 94))
-		CameraDirector.GlideTo(CFrame.lookAt(sideCam, beltEnd + Vector3.new(0, 1.5, 0)), timings.Conveyor, Enum.EasingStyle.Sine, 60)
+		-- Beside the bay, outside the podium ring (podium 4 and its hologram stand
+		-- between the front camera and the belt), looking down the belt at the tube.
+		local sideCam = view:ToWorld(Vector3.new(12, 9, 106))
+		local sideAim = view:ToWorld(Vector3.new(28, 5, 110))
+		CameraDirector.GlideTo(CFrame.lookAt(sideCam, sideAim), timings.Conveyor, Enum.EasingStyle.Sine, 60)
+		cine:Focus(model.PrimaryPart or beltEnd)
 		local beltStart = rootCf.Position
-		local travelRotation = CFrame.lookAt(beltStart, Vector3.new(beltEnd.X, beltStart.Y, beltEnd.Z)).Rotation
+		local beltStop = Vector3.new(beltEnd.X, beltStart.Y, beltEnd.Z)
+		local beltLength = (beltStop - beltStart).Magnitude
+		local travelRotation = CFrame.lookAt(beltStart, beltStop).Rotation
+		local fromRotation = model:GetPivot().Rotation
 		if not animate(s, timings.Conveyor, function(alpha)
-			local p = beltStart:Lerp(Vector3.new(beltEnd.X, beltStart.Y, beltEnd.Z), ease(alpha, Enum.EasingStyle.Sine))
-			model:PivotTo(CFrame.new(p) * travelRotation)
+			local p = beltStart:Lerp(beltStop, ease(alpha, Enum.EasingStyle.Sine))
+			-- turns onto the belt instead of snapping to the travel direction
+			model:PivotTo(CFrame.new(p) * fromRotation:Lerp(travelRotation, ease(alpha / 0.3, Enum.EasingStyle.Sine)))
+			-- speed of the Sine in-out travel, so the vacuum rides the slats
+			driveBelt(beltLength * math.pi / 2 * math.sin(alpha * math.pi) / timings.Conveyor)
+			-- open the tube's glass towards the belt before the nose reaches it
+			setPanes(inDoor, math.clamp((alpha - 0.5) / 0.25, 0, 1))
 		end) then
 			return
 		end
+		driveBelt(nil)
 
-		-- 6) Into the tube
-		local tube = view:ToWorld(config.ExitTube)
+		-- 6) Into the tube (through the opened glass)
 		Audio.PlayAt("Tube", tube)
 		local startCf = model:GetPivot()
 		if not animate(s, 0.6, function(alpha)
 			local p = startCf.Position:Lerp(tube + Vector3.new(0, 9, 0), ease(alpha, Enum.EasingStyle.Quad))
-			model:PivotTo(CFrame.new(p) * startCf.Rotation * CFrame.Angles(0, alpha * 6, 0))
+			-- spins up once inside, so a long body does not sweep through the glass
+			model:PivotTo(CFrame.new(p) * startCf.Rotation * CFrame.Angles(0, alpha ^ 3 * 6, 0))
 			for _, part in parts do
 				part.Transparency = original[part] + (1 - original[part]) * alpha
 			end
@@ -395,20 +537,28 @@ function PurchaseShow.Play(view, vacuumId: string, result: { [string]: any })
 			return
 		end
 		Effects.Burst(tube + Vector3.new(0, 10, 0), "Glow", 20, rarity.Color)
+		fadePanes(inDoor, 0, 0.4)
 
 		-- 7) The player steps out of the tube
 		local finaleCam = view:ToWorld(config.FinaleCamera)
+		local finaleCf = CFrame.lookAt(finaleCam, tube + Vector3.new(0, 3.5, 0))
 		local root = controller:GetRoot()
 		cine:Focus(if root then root else tube)
-		CameraDirector.GlideTo(CFrame.lookAt(finaleCam, tube + Vector3.new(0, 3.5, 0)), 0.5, Enum.EasingStyle.Quint, 55)
+		CameraDirector.GlideTo(finaleCf, 0.5, Enum.EasingStyle.Quint, 55)
 		stepOut(s)
-		s:Wait(timings.Banner)
+		-- ease back to the player's field of view before the camera is handed back
+		if s:Wait(math.max(timings.Banner - 0.6, 0)) then
+			CameraDirector.GlideTo(finaleCf, 0.6, Enum.EasingStyle.Sine, CameraDirector.BaseFov())
+			s:Wait(0.6)
+		end
 	end, function(s)
 		for _, stop in stops do
 			stop()
 		end
 		cine:End()
 		CameraDirector.StopFollow()
+		driveBelt(nil)
+		fadePanes(inDoor, 0, 0.3)
 		if not s.Cancelled then
 			if not state.Placed then
 				stepOut(nil)

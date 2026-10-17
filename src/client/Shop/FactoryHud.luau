@@ -37,9 +37,9 @@ export type PanelSpec = {
 -- Nav cell and gap (before the nav's own scale)
 local NAV_CELL = Vector2.new(64, 56)
 local NAV_GAP = 8
--- Below this nav scale the 10 px captions would render under 8 px (phones):
--- the icons stand alone there.
-local CAPTION_MIN_SCALE = 0.8
+-- Below this nav scale the captions (10 px, about 9 px for the 8-letter names)
+-- would render under 8 px (phones): the icons stand alone there.
+local CAPTION_MIN_SCALE = 0.9
 
 -- Rough height of a panel's text column. Body text is 15 px (18 px lines) and
 -- wraps at about 7.5 px per character; anything taller scrolls.
@@ -50,8 +50,12 @@ local function columnHeight(spec: PanelSpec, width: number): number
 		return 18 * math.max(math.ceil((utf8.len(plain) or #plain) / perLine), 1)
 	end
 	local height, count = 30, 1
-	if spec.Rarity or spec.Kicker then
+	if spec.Rarity then
 		height += 20
+		count += 1
+	end
+	if spec.Kicker then
+		height += 16
 		count += 1
 	end
 	if spec.Bars then
@@ -489,10 +493,17 @@ end
 
 function FactoryHud:SetVisible(visible: boolean)
 	self.Visible = visible
+	local was = self.Gui.Enabled
 	-- (stays off while a show runs; SetCinematic(false) plays the entrance then)
 	self.Gui.Enabled = visible and not self.Cinematic
-	if self.Gui.Enabled and self.NavShown then
-		self:_slide(self.Nav, true, true, nil, true)
+	if self.Gui.Enabled and not was then
+		-- the nav enters from off-screen; the rest return from wherever a show
+		-- that ended while the gui was off left them (in place: no move)
+		for object, isShown in self:_edges() do
+			if isShown then
+				self:_slide(object, true, true, nil, object == self.Nav)
+			end
+		end
 	end
 	self:_navChanged()
 end
@@ -641,12 +652,14 @@ function FactoryHud:ShowPanel(spec: PanelSpec)
 		Parent = panel,
 	}, { UI.List(Enum.FillDirection.Vertical, 6) })
 
+	-- (a kicker goes under the rarity tag, e.g. "TEST RESULT · <vacuum>")
 	if spec.Rarity then
 		UI.RarityTag(spec.Rarity, { LayoutOrder = 1, Parent = column })
-	elseif spec.Kicker then
-		UI.Label({ Text = string.upper(spec.Kicker), Size = UDim2.new(1, 0, 0, 16), TextSize = 13, TextColor3 = Theme.Colors.Accent, FontFace = Theme.Fonts.Title, LayoutOrder = 1, Parent = column })
 	end
-	local title = UI.Label({ Text = spec.Title, Size = UDim2.new(1, 0, 0, 30), FontFace = Theme.Fonts.Title, TextScaled = true, LayoutOrder = 2, Parent = column })
+	if spec.Kicker then
+		UI.Label({ Text = string.upper(spec.Kicker), Size = UDim2.new(1, 0, 0, 16), TextSize = 13, TextColor3 = Theme.Colors.Accent, FontFace = Theme.Fonts.Title, LayoutOrder = 2, Parent = column })
+	end
+	local title = UI.Label({ Text = spec.Title, Size = UDim2.new(1, 0, 0, 30), FontFace = Theme.Fonts.Title, TextScaled = true, LayoutOrder = 3, Parent = column })
 	UI.new("UITextSizeConstraint", { MaxTextSize = 26, Parent = title })
 
 	if spec.Bars then
